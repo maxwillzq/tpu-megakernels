@@ -27,6 +27,8 @@ def build_parser():
     p.add_argument("--req-buckets", type=_ints, default=())
     p.add_argument("--expert-format", choices=["bf16", "mxfp4"])
     p.add_argument("--target-tpu", default="7x")
+    p.add_argument("--topology", help="lower for this TPU topology on any host, e.g. tpu7x:4x4x2 "
+                   "(32 devices); needs libtpu. Default: the local (CPU) devices")
     p.add_argument("--weights", choices=["checkpoint", "random", "none"], default=None,
                    help="what to write into serving_checkpoint (default: checkpoint, or random with --tiny)")
     p.add_argument("--seed", type=int, default=0)
@@ -42,7 +44,7 @@ TINY_CONFIG = dict(
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if "jax" not in sys.modules and os.environ.get("JAX_PLATFORMS", "") in ("", "cpu"):
+    if not args.topology and "jax" not in sys.modules and os.environ.get("JAX_PLATFORMS", "") in ("", "cpu"):
         flags = os.environ.get("XLA_FLAGS", "")
         if "device_count" not in flags:
             os.environ["XLA_FLAGS"] = f"{flags} --xla_force_host_platform_device_count={args.tp}".strip()
@@ -68,6 +70,7 @@ def main(argv=None):
         output_dir=args.output_dir, tp=args.tp, max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len, block_size=args.block_size, num_blocks=args.num_blocks,
         token_buckets=args.token_buckets, req_buckets=args.req_buckets, target_tpu=args.target_tpu,
+        topology=args.topology,
     )
     adapter = KimiAdapter(layout, cfg, checkpoint=args.checkpoint,
                           model_name=args.checkpoint or "kimi-k3-tiny")

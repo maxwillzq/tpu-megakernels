@@ -16,6 +16,9 @@ class ExportConfig:
     token_buckets: tuple[int, ...]
     req_buckets: tuple[int, ...] = ()
     target_tpu: str = "7x"
+    # Lower against this TPU topology (e.g. "tpu7x:4x4x2") instead of the local devices; needs
+    # libtpu, not TPU hardware.
+    topology: str | None = None
     model_name: str = ""
     extra: dict = field(default_factory=dict)
 

@@ -12,7 +12,9 @@ shard-local bodies. The artifact holds (RFC 0001):
 
 import contextlib
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import jax
@@ -103,14 +105,28 @@ def _check_signature(text, name, in_specs, out_specs, axis_sizes):
                 raise ValueError(f"{name}: {kind} {spec.name} is {shape} {dtype}, expected {want}")
 
 
+def lowering_devices(cfg):
+    """The devices to lower for: an abstract TPU topology when ``cfg.topology`` is set (so a
+    CPU host lowers TPU programs, Pallas TPU kernels included), else the local devices."""
+    if cfg.topology is None:
+        return jax.devices()
+    # No TPU is used, so several lowering processes may load libtpu at once; and its default
+    # log directory, /tmp/tpu_logs, may belong to another user.
+    os.environ.setdefault("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
+    os.environ.setdefault("TPU_LOG_DIR", os.path.join(tempfile.gettempdir(), f"tpu_logs_{os.getuid()}"))
+    from jax.experimental import topologies
+
+    return topologies.get_topology_desc(cfg.topology, "tpu").devices
+
+
 class Exporter:
     def __init__(self, adapter, cfg):
         self.adapter, self.cfg = adapter, cfg
-        devices = jax.devices()
+        devices = lowering_devices(cfg)
         if len(devices) < cfg.tp:
             raise RuntimeError(
-                f"lowering for tp={cfg.tp} needs {cfg.tp} devices; on CPU set "
-                f"XLA_FLAGS=--xla_force_host_platform_device_count={cfg.tp}"
+                f"lowering for tp={cfg.tp} needs {cfg.tp} devices; pass a larger topology, or "
+                f"on CPU set XLA_FLAGS=--xla_force_host_platform_device_count={cfg.tp}"
             )
         self.mesh = Mesh(np.array(devices[: cfg.tp]), (adapter.axis,))
         self.axis_sizes = {adapter.axis: cfg.tp, "data": 1}

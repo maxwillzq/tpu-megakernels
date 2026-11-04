@@ -20,7 +20,12 @@ JAX_PLATFORMS=cpu python -m export kimi --checkpoint /path/to/Kimi-K3 --tp 32 \
   --block-size 128 --num-blocks 2048 --token-buckets 16,32,64,128,256,512
 ```
 
-- Lowering runs on CPU; the CLI sets `--xla_force_host_platform_device_count` to `--tp`.
+- Lowering runs on CPU. By default it lowers for `--tp` virtual CPU devices (the CLI sets
+  `--xla_force_host_platform_device_count`). `--topology tpu7x:4x4x2` lowers for an abstract TPU
+  topology instead (`jax.experimental.topologies`; needs libtpu, `pip install "jax[tpu]"`, but no
+  TPU). The pure-JAX forward gives the same StableHLO either way; the topology is what lets Pallas
+  TPU kernels such as the megakernel lower, as `tpu_custom_call`. `tpu7x:4x4x2` has 32 devices
+  (16 chips, two TensorCores each).
 - `--weights none` writes the subgraphs and metadata only. rvllm serves such an artifact with
   `--load-format dummy`. `--weights checkpoint` (the default with `--checkpoint`) converts the
   checkpoint; `--weights random` writes random weights.
@@ -84,7 +89,8 @@ Points that matter when lowering:
 ```bash
 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
   pytest tests/test_kimi_model_cpu.py tests/test_kimi_export_cpu.py \
-         tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py
+         tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py \
+         tests/test_export_topology_cpu.py
 ```
 
 - `test_kimi_model_cpu.py`: the ragged, paged forward against an independent per-token
@@ -94,6 +100,8 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
   and checkpoint. With `RVLLM_BIN` and `PJRT_CPU_LIB_PATH` set, it also serves the artifact with
   rvllm on CPU and checks the greedy tokens against the reference.
 - `test_kimi_checkpoint_cpu.py`: Hugging Face checkpoint conversion, as a bit-exact round trip.
+- `test_export_topology_cpu.py`: lowering for an abstract TPU topology; a Pallas kernel comes out
+  shard-local as `tpu_custom_call` (skipped without libtpu).
 - `test_kimi_tokenizer_cpu.py`: the converted tokenizer encodes like tiktoken, and the chat
   template renders `openai_server.render_chat_tokens`' tokens.
 
