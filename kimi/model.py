@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from . import Config, attention_residual, kda_step, rms, route, unpack_mxfp4
+from . import Config, attention_residual, kda_step, rms, unpack_mxfp4
 
 
 @dataclass(frozen=True)
@@ -220,12 +220,24 @@ def _expert_weights(w, e, layout):
     return tuple(unpack_mxfp4(w[n][e], w[n + "_scale"][e]) for n in names)
 
 
+def route_rows(logits, bias, top_k):
+    """``kimi.route`` for [T, E] logits, selecting with a stable sort instead of ``top_k``.
+
+    Ties go to the lower expert id either way; a sort lowers to ``stablehlo.sort``, which every
+    StableHLO consumer runs, where ``lax.top_k`` lowers to ``chlo.top_k``.
+    """
+    scores = jax.nn.sigmoid(logits.astype(jnp.float32))
+    ids = jnp.argsort(-(scores + bias), axis=-1, stable=True)[:, :top_k].astype(jnp.int32)
+    weights = jnp.take_along_axis(scores, ids, axis=-1)
+    return ids, weights / jnp.sum(weights, axis=-1, keepdims=True)
+
+
 def moe_layer(x, w, rank, layout, axis):
     """Latent MoE: routed experts in latent space (expert parallel) plus a shared expert."""
     c = layout.config
     local = c.experts // layout.tp
     logits = _dot(x, w["router"])
-    ids, weights = jax.vmap(lambda lg: route(lg, w["router_bias"].astype(jnp.float32), c.top_k))(logits)
+    ids, weights = route_rows(logits, w["router_bias"].astype(jnp.float32), c.top_k)
     first = rank * local
     # combine[t, e]: routing weight of local expert e for token t (0 when not selected).
     onehot = ids[:, :, None] == (first + jnp.arange(local))[None, None, :]
