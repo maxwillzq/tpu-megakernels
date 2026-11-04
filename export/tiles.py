@@ -46,6 +46,30 @@ def forward(kernel, states, controls, num_tokens, hidden_size, tile=TILE):
     hidden = jnp.zeros((num_tokens, hidden_size), jnp.bfloat16)
     rows = jnp.arange(tile, dtype=jnp.int32)
 
+    zero = np.int32(0)
+
+    # Slot arrays are only ever sliced and updated along their leading (slot) dimension, one slot
+    # at a time: index-array gathers and scatters into them make XLA pick another layout for the
+    # whole multi-gigabyte cache than the kernel takes, and relayout it on every step.
+    def take(state, slot_ids):
+        """``state[slot_ids]`` for a static number of slots."""
+        return jnp.concatenate(
+            [jax.lax.dynamic_slice_in_dim(state, slot_ids[i], 1, axis=0) for i in range(slot_ids.shape[0])]
+        )
+
+    def put(state, slot_ids, values):
+        """``state`` with ``values[i]`` at slot ``slot_ids[i]`` (later rows win)."""
+        for i in range(slot_ids.shape[0]):
+            start = (slot_ids[i],) + (zero,) * (state.ndim - 1)
+            state = jax.lax.dynamic_update_slice(state, values[i : i + 1].astype(state.dtype), start)
+        return state
+
+    def put_position(cache, out, row, slot, pos):
+        """``cache`` with cache position ``pos`` of ``out`` row ``row`` written at ``slot``."""
+        size = (1, *out.shape[1:3], 1, out.shape[4])
+        window = jax.lax.dynamic_slice(out, (row, zero, zero, pos, zero), size)
+        return jax.lax.dynamic_update_slice(cache, window.astype(cache.dtype), (slot, zero, zero, pos, zero))
+
     def fresh(state, new):
         """``state`` with the rows of new sequences (position 0) zeroed: slots are reused."""
         new = jnp.reshape(new, new.shape + (1,) * (state.ndim - new.ndim))
@@ -67,13 +91,15 @@ def forward(kernel, states, controls, num_tokens, hidden_size, tile=TILE):
         tokens = jnp.where(valid, ids[token_index], 0)
         pos = jnp.where(valid, positions[token_index], 0)
         h, (c, r, k, v) = kernel(
-            (fresh(conv[slot], pos == 0), fresh(rec[slot], pos == 0), key[slot], value[slot]), tokens, pos, 1
+            (fresh(take(conv, slot), pos == 0), fresh(take(rec, slot), pos == 0), take(key, slot), take(value, slot)),
+            tokens, pos, 1,
         )
-        conv = conv.at[slot].set(c)
-        rec = rec.at[slot].set(r)
+        conv = put(conv, slot, c)
+        rec = put(rec, slot, r)
         # Each row wrote one cache position.
-        key = key.at[slot, :, :, pos].set(k[rows, :, :, pos])
-        value = value.at[slot, :, :, pos].set(v[rows, :, :, pos])
+        for i in range(tile):
+            key = put_position(key, k, i, slot[i], pos[i])
+            value = put_position(value, v, i, slot[i], pos[i])
         hidden = hidden.at[jnp.where(valid, token_index, num_tokens)].set(h.astype(hidden.dtype), mode="drop")
         return conv, rec, key, value, hidden
 
@@ -96,15 +122,13 @@ def forward(kernel, states, controls, num_tokens, hidden_size, tile=TILE):
         first = positions[start]
         slot = slots[request]
         # The chained recurrence reads row 0's input state.
-        rows_of = lambda s: jnp.broadcast_to(fresh(s[slot], first == 0), (tile, *s.shape[1:]))  # noqa: E731
-        h, (cs, rs, k, v) = kernel(
-            (rows_of(conv), rows_of(rec), key[slot][None], value[slot][None]), tokens, first + rows, tile
-        )
+        one = lambda s: jax.lax.dynamic_slice_in_dim(s, slot, 1, axis=0)  # noqa: E731
+        rows_of = lambda s: jnp.broadcast_to(fresh(one(s), first == 0), (tile, *s.shape[1:]))  # noqa: E731
+        h, (cs, rs, k, v) = kernel((rows_of(conv), rows_of(rec), one(key), one(value)), tokens, first + rows, tile)
         last = count - 1
-        conv = conv.at[slot].set(cs[last])
-        rec = rec.at[slot].set(rs[last])
+        conv = put(conv, slot[None], jax.lax.dynamic_slice_in_dim(cs, last, 1, axis=0))
+        rec = put(rec, slot[None], jax.lax.dynamic_slice_in_dim(rs, last, 1, axis=0))
         # The tile wrote cache positions first .. first + tile - 1.
-        zero = np.int32(0)
 
         def write_window(cache, out):
             window = jax.lax.dynamic_slice_in_dim(out[0], first, tile, axis=2)

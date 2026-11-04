@@ -118,7 +118,8 @@ def compile_shard_local(text, devices, name="module"):
     topology, so compile-time failures (a kernel exceeding VMEM, for example) show at export.
 
     Compiling the global ``jit(shard_map(...))`` program instead runs XLA's SPMD partitioner over
-    the manual region, which the runtime never does (and which crashes on the full Kimi stack)."""
+    the manual region, which the runtime never does (and which crashes on the full Kimi stack).
+    Returns the compiled executable (its ``hlo_modules()`` are the optimized program)."""
     import numpy as np
     from jax._src import compiler
     from jax._src.interpreters import mlir
@@ -130,8 +131,8 @@ def compile_shard_local(text, devices, name="module"):
     with mlir.make_ir_context():
         module = mlir.ir.Module.parse(text)
         try:
-            devices[0].client.compile(module, executable_devices=xc.DeviceList(tuple(devices)),
-                                      compile_options=options)
+            return devices[0].client.compile(module, executable_devices=xc.DeviceList(tuple(devices)),
+                                             compile_options=options)
         except Exception as e:  # noqa: BLE001  (XLA raises a generic runtime error)
             raise RuntimeError(f"{name} does not compile for {devices[0].device_kind}: {e}") from e
 
