@@ -25,6 +25,12 @@ _ZARR_DTYPES = {
 }
 
 
+_ITEMSIZE = {"bfloat16": 2, "float32": 4, "float16": 2, "int32": 4, "int64": 8, "uint32": 4, "uint8": 1,
+             "int8": 1, "float8_e4m3fn": 1}
+# A per-rank slab larger than this is chunked per layer (one large expert layer is ~600 MB).
+CHUNK_BYTES = 256 << 20
+
+
 class CheckpointWriter:
     """Creates ``<artifact>/serving_checkpoint/data/array_{i}`` and writes regions into them."""
 
@@ -51,10 +57,13 @@ class CheckpointWriter:
             for d, axis in enumerate(spec.sharding):
                 if axis is not None:
                     chunks[d] = spec.shape[d] // self.axis_sizes[axis]
-            if len(spec.shape) >= 3:
+            if spec.sharding[0] is not None and spec.shape[0] == self.axis_sizes[spec.sharding[0]]:
+                # Per-rank arrays [ranks, ...]: one chunk per rank, split by its leading (layer)
+                # dim only when a rank's slab is large, so small families stay a few objects.
+                if len(spec.shape) >= 3 and np.prod(chunks) * _ITEMSIZE[spec.dtype] > CHUNK_BYTES:
+                    chunks[1] = 1
+            elif len(spec.shape) >= 3:
                 chunks[0] = 1  # stacked layer families: one layer per chunk
-                if spec.sharding[0] is not None and len(spec.shape) >= 4:
-                    chunks[1] = 1  # per-rank stacked families [ranks, layers, ...]: one rank's layer
             self.arrays[name] = ts.open(
                 {
                     "driver": "zarr",
