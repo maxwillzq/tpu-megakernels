@@ -107,6 +107,9 @@ class KimiAdapter:
             template = (src / "chat_template.jinja").read_text()
         elif src is not None and (src / "tokenizer_config.json").exists():
             template = json.loads((src / "tokenizer_config.json").read_text()).get("chat_template")
+        if template is None and src is not None:
+            # K3 renders chat in Python (encoding_k3.py); this template renders the same tokens.
+            template = (Path(__file__).parent / "kimi_chat_template.jinja").read_text()
         if isinstance(template, str):
             (out / "chat_template.jinja").write_text(template)
             entries["chat_template"] = {"path": "chat_template.jinja"}

@@ -129,3 +129,13 @@ def test_ragged_paged_forward_matches_per_token_reference(tp, expert_format):
         got_seq = np.concatenate(got[seq])
         want = run_sequence(layout, weights, fed[: len(got_seq)])
         _close(got_seq, want, f"seq {seq} (tp={tp}, {expert_format})")
+
+
+def test_constant_free_mxfp4_unpack_matches_the_reference():
+    rng = np.random.default_rng(0)
+    packed = rng.integers(0, 2**32, (8, 40), dtype=np.uint32)  # K = 64
+    scales = rng.integers(110, 140, (2, 40), dtype=np.uint8)
+    np.testing.assert_array_equal(
+        np.asarray(model.unpack_mxfp4(packed, scales), np.float32),
+        np.asarray(kimi.unpack_mxfp4(packed, scales), np.float32),
+    )

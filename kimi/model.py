@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from . import Config, attention_residual, kda_step, rms, unpack_mxfp4
+from . import Config, attention_residual, kda_step, rms
 
 
 @dataclass(frozen=True)
@@ -210,6 +210,23 @@ def mla_layer(x, w, cache, layer, positions, token_seqs, valid, block_tables, la
     out = jnp.einsum("thr,rhd->thd", ctx, kv_b[:, :, 1].astype(jnp.float32))
     out = out.astype(x.dtype) * jax.nn.sigmoid(_dot(x, w["g_proj"])).astype(x.dtype).reshape(t, heads, nope)
     return jax.lax.psum(_dot(out.reshape(t, heads * nope), w["o_proj"]), axis), cache
+
+
+def unpack_mxfp4(packed, scales):
+    """``kimi.unpack_mxfp4`` without array constants: [K/8, N] u32, [K/32, N] E8M0 -> [K, N].
+
+    The FP4 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} come from arithmetic on the code instead of a
+    lookup table: a table is a concrete array, which lowering hoists into an extra parameter of
+    the shard-local program (one per expert matrix).
+    """
+    shifts = jax.lax.broadcasted_iota(jnp.uint32, (1, 8, 1), 1) * 4
+    codes = ((packed[:, None, :] >> shifts) & 15).reshape(-1, packed.shape[-1])
+    m = (codes & 7).astype(jnp.float32)
+    e = m - 4
+    high = jnp.exp2(1 + jnp.floor(e / 2)) * (1 + 0.5 * jnp.mod(e, 2))
+    values = jnp.where(m < 4, m * 0.5, high) * jnp.where(codes & 8, -1.0, 1.0)
+    scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
+    return (values * jnp.repeat(scale, 32, axis=0)).astype(jnp.bfloat16)
 
 
 def _expert_weights(w, e, layout):
