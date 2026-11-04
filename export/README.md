@@ -45,7 +45,7 @@ For example, the subgraphs on any host and the weights on a large CPU host:
 python -m export kimi --checkpoint K3_DIR --output-dir ART --weights none --max-num-seqs 32 \
   --max-model-len 4096 --num-blocks 1056
 python -m export kimi --checkpoint K3_DIR --output-dir /tmp/unused --checkpoint-only --num-blocks 1 \
-  --presharded gs://cloud-devkit/ckpt/presharded/kimi-k3-tp32 --checkpoint-dir ART/ --workers 6
+  --presharded gs://BUCKET/kimi-k3-tp32 --checkpoint-dir ART/ --workers 6
 ```
 
 ## How a step runs
@@ -133,7 +133,7 @@ JAX_PLATFORMS=cpu pytest tests/test_export_tiles_cpu.py tests/test_kimi_export_c
 Checked against the published checkpoint's headers:
 - the full 93-layer artifact exports in about 30 s and passes vllm-torchtpu's validator;
 - its 37 weight families have exactly the shapes and dtypes of the megakernel's pre-sharded
-  weights (`gs://cloud-devkit/ckpt/presharded/kimi-k3-tp32`), gate/up after the FP8 reblock.
+  weights (written by `kimi.load`), gate/up after the FP8 reblock.
 
 ## Limitations and next steps
 
