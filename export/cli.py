@@ -48,6 +48,10 @@ def build_parser():
                    help="write only serving_checkpoint (no lowering, no libtpu): e.g. on a CPU host, for "
                         "an artifact whose subgraphs were exported with --weights none")
     p.add_argument("--workers", type=int, default=2, help="ranks converted in parallel")
+    p.add_argument("--draft", help="DSpark speculator checkpoint directory (RedHatAI/Kimi-K3-speculator.dspark): "
+                   "also export it as rvllm's mtp_draft, drafting --max-verify-tokens tokens per step")
+    p.add_argument("--draft-weights-only", action="store_true",
+                   help="with --checkpoint-only: add only the drafter's arrays to an existing serving_checkpoint")
     return p
 
 
@@ -65,7 +69,7 @@ def main(argv=None):
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,
-                          model_name=args.checkpoint)
+                          model_name=args.checkpoint, draft=args.draft)
     if args.checkpoint_only:
         # abstract_params order: constants, then weights (export.exporter.Exporter.slots).
         specs, axis_sizes = adapter.constant_specs() + adapter.param_specs(), {adapter.axis: TP, "data": 1}
@@ -75,7 +79,8 @@ def main(argv=None):
         specs, axis_sizes = ex.checkpoint_specs(), ex.axis_sizes
     if args.weights == "checkpoint":
         adapter.write_checkpoint(args.checkpoint_dir or cfg.output_dir, specs, axis_sizes,
-                                 presharded=args.presharded, workers=args.workers)
+                                 presharded=args.presharded, workers=args.workers,
+                                 draft_only=args.draft_weights_only)
     print(f"wrote {cfg.output_dir}")
 
 

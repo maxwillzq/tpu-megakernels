@@ -30,12 +30,16 @@ class ExportConfig:
     def __post_init__(self):
         self.token_buckets = tuple(sorted(set(int(b) for b in self.token_buckets)))
         if not self.req_buckets:
-            # Powers of two from 8, always ending at max_num_seqs (as vllm-torchtpu).
+            # Powers of two from 8, always ending at the most rows a step samples: max_num_seqs,
+            # or with verify tokens every sequence's verify window, up to the largest bucket.
+            top = self.max_num_seqs
+            if self.max_verify_tokens:
+                top = max(top, min(self.max_num_seqs * (self.max_verify_tokens + 1), max(self.token_buckets)))
             buckets, size = [], 8
-            while size < self.max_num_seqs:
+            while size < top:
                 buckets.append(size)
                 size *= 2
-            self.req_buckets = tuple(buckets + [self.max_num_seqs])
+            self.req_buckets = tuple(buckets + [top])
         self.req_buckets = tuple(sorted(set(int(r) for r in self.req_buckets)))
         if self.max_verify_tokens < 0:
             raise ValueError(f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}")

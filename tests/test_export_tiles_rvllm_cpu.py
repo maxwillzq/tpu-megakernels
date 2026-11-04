@@ -7,7 +7,9 @@ a stand-in kernel and a one-character-per-token tokenizer. Checks:
   reused, prompts span several tiles), generate the reference's tokens;
 - structured outputs (JSON schemas) give valid JSON, and the same text with jump-forward decoding
   (grammar-forced tokens verified as drafts, which needs the recurrent checkpoints) as without
-  it, in fewer engine steps.
+  it, in fewer engine steps;
+- with a drafter (rvllm's ``mtp_draft``, whose drafts are the target's greedy tokens), free-form
+  and structured requests give the same text in fewer steps still.
 
 Needs ``RVLLM_BIN`` and ``PJRT_CPU_LIB_PATH`` (the rvllm-dev image has both the binary's
 dependencies and ``/usr/local/lib/rvllm/pjrt_c_api_cpu_plugin.so``).
@@ -47,13 +49,13 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _export(path, verify):
+def _export(path, verify, draft=False):
     from export import api, checkpoint, exporter
     from toy_tiles_adapter import TP, ToyAdapter
 
     cfg = api.ExportConfig(str(path), TP, max_num_seqs=4, max_model_len=64, block_size=16, num_blocks=40,
                            token_buckets=(8, 32), max_verify_tokens=verify)
-    adapter = ToyAdapter(cfg)
+    adapter = ToyAdapter(cfg, draft=draft)
     ex = exporter.Exporter(adapter, cfg)
     ex.export(log=lambda *_: None)
     tensors = adapter.tensors()
@@ -114,8 +116,9 @@ def test_rvllm_serves_the_toy_artifact_like_the_reference(tmp_path):
         pytest.skip(f"needs {TP} devices (XLA_FLAGS=--xla_force_host_platform_device_count)")
     jump_adapter, tensors = _export(tmp_path / "jump", verify=3)
     _export(tmp_path / "plain", verify=0)
-    texts = {}
-    for name in ("jump", "plain"):
+    _export(tmp_path / "draft", verify=3, draft=True)
+    texts, free_steps = {}, {}
+    for name in ("jump", "plain", "draft"):
         with _serve(tmp_path / name) as port:
             results = {}
 
@@ -133,6 +136,20 @@ def test_rvllm_serves_the_toy_artifact_like_the_reference(tmp_path):
                 want_text = "".join(CHARS[t] for t in want if t != EOS)
                 assert results[i]["choices"][0]["text"] == want_text, (name, prompt)
             texts[name] = [_structured(port, schema) for schema in SCHEMAS]
+            before = _steps(port)
+            r = _post(port, "/v1/completions", {"model": "art", "prompt": PROMPTS[2], "max_tokens": 24,
+                                                "temperature": 0, "ignore_eos": True})
+            free_steps[name] = _steps(port) - before
+            want = reference_greedy(tensors, encode(PROMPTS[2]), 24, jump_adapter.context, stop_at_eos=False)
+            assert r["choices"][0]["text"] == "".join(CHARS[t] for t in want if t != EOS), name
+    print(f"free-form, 24 tokens: {free_steps}")
+    # The drafter's drafts are the target's own greedy tokens, so each step after the prefill
+    # verifies all 3 and adds the bonus token: 1 + ceil(23 / 4) = 7 steps; allow one miss (bf16).
+    assert free_steps["draft"] <= 8 < free_steps["plain"], free_steps
+    for (draft_text, draft_steps), (plain_text, _), (_, jump_steps) in zip(texts["draft"], texts["plain"], texts["jump"]):
+        print(f"structured {draft_text!r}: {draft_steps} steps with the drafter")
+        assert draft_text == plain_text
+        assert draft_steps <= jump_steps, (draft_text, draft_steps, jump_steps)
     for (jump_text, jump_steps), (plain_text, plain_steps), schema in zip(texts["jump"], texts["plain"], SCHEMAS):
         print(f"structured {jump_text!r}: {jump_steps} steps with jump-forward decoding, {plain_steps} without")
         assert jump_text == plain_text, (jump_text, plain_text)
