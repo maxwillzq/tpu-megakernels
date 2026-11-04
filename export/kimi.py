@@ -12,6 +12,7 @@ lowered for, and must be lowered for the target TPU topology (``--topology``).
 """
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -53,10 +54,11 @@ def family_counts(layers):
     return layers - (layers // 4 + (layers == 93)), mla
 
 
-def cache_length(max_model_len):
-    """MLA cache positions per slot: room for a sequence tile past the last token, in the
-    kernel's 128-position cache tiles."""
-    return max(384, -(-(max_model_len + tiles.TILE) // 128) * 128)
+def cache_length(max_model_len, block_size=128):
+    """MLA cache positions the kernel takes per sequence: room for a sequence tile past the last
+    token, in whole 128-position kernel cache tiles and whole ``block_size`` pages."""
+    unit = math.lcm(128, block_size)
+    return max(384, -(-(max_model_len + tiles.TILE) // unit) * unit)
 
 
 class HeaderCheckpoint(load.Checkpoint):
@@ -118,11 +120,14 @@ class KimiAdapter:
     axis = "model"  # metadata axis (rvllm's)
     mesh_axis = "tp"  # the megakernel's shard_map axis
 
-    def __init__(self, checkpoint, cfg, *, layers=93, gate_up="fp8", model_name="kimi-k3"):
+    def __init__(self, checkpoint, cfg, *, layers=93, gate_up="fp8", model_name="kimi-k3", draft=None):
         if cfg.tp != TP:
             raise ValueError("the Kimi megakernel is TP32")
         if cfg.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be positive")
+        if cfg.max_verify_tokens >= tiles.TILE:
+            raise ValueError(f"max_verify_tokens must be below {tiles.TILE}: a verify window is one "
+                             "sequence tile of the kernel")
         self.checkpoint = checkpoint
         self.source = Path(checkpoint.path)
         self.cfg, self.layers = cfg, layers
@@ -132,7 +137,15 @@ class KimiAdapter:
         self.eos_token_id = self._checkpoint_eos()
         self.gate_up = gate_up
         self.weights = weight_layout(checkpoint, layers, gate_up)
-        self.context = cache_length(cfg.max_model_len)
+        self.context = cache_length(cfg.max_model_len, cfg.block_size)
+        # The DSpark drafter (``export.dspark_draft``), exported as rvllm's ``mtp_draft``.
+        self.drafter = None
+        if draft is not None:
+            from .dspark_draft import DSparkDrafter
+
+            self.drafter = DSparkDrafter.from_checkpoint(draft, cfg, TP, axis=self.axis)
+            if max(self.drafter.c.aux_layers) >= layers:
+                raise ValueError(f"the drafter reads layer {max(self.drafter.c.aux_layers)}; export all layers")
 
     def _checkpoint_eos(self):
         for name in ("generation_config.json", "config.json"):
@@ -147,36 +160,44 @@ class KimiAdapter:
 
     # Tensors.
     def param_specs(self):
-        """Every weight as ``[32, *local]`` split over ranks; the LM head is last."""
+        """Every weight as ``[32, *local]`` split over ranks: the model's, the LM head, then the
+        drafter's (so adding a drafter keeps the model's checkpoint arrays)."""
         names = [n for n in self.weights if n != "lm_head"] + ["lm_head"]
-        return [
+        specs = [
             Spec(n, (TP, *self.weights[n][0]), self.weights[n][1], (self.axis,) + (None,) * len(self.weights[n][0]))
             for n in names
         ]
+        return specs + (self.drafter.param_specs() if self.drafter else [])
 
     def forward_param_specs(self):
-        return [s for s in self.param_specs() if s.name != "lm_head"]
+        return [Spec(n, (TP, *shape), dtype, (self.axis,) + (None,) * len(shape))
+                for n, (shape, dtype) in self.weights.items() if n != "lm_head"]
 
     def lm_head_spec(self):
-        return self.param_specs()[-1]
+        shape, dtype = self.weights["lm_head"]
+        return Spec("lm_head", (TP, *shape), dtype, (self.axis,) + (None,) * len(shape))
 
     def constant_specs(self):
         return [Spec("rank", (TP,), "int32", (self.axis,))]
 
     def control_specs(self, bucket):
-        return control_specs(bucket, self.cfg.max_num_seqs, self.cfg.pages_per_seq)
+        cfg = self.cfg
+        return control_specs(bucket, cfg.max_num_seqs, cfg.pages_per_seq, cfg.recurrent_window,
+                             cfg.num_state_slots)
 
     def state_specs(self):
-        """KDA convolution history and recurrent state, and the MLA key/value caches, by slot.
+        """KDA convolution history and recurrent state in recurrent state slots, and the MLA
+        key/value caches in pages of ``block_size`` positions.
 
         Global head dims are 32 x the kernel's 3 heads per rank."""
         k, m = family_counts(self.layers)
         s, h, a = self.cfg.num_state_slots, HEADS * TP, self.axis
+        blocks, bs = self.cfg.num_blocks, self.cfg.block_size
         return [
             Spec("kda_conv", (s, k, 3, h, 3, 128), "bfloat16", (None, None, None, a, None, None)),
             Spec("kda_state", (s, k, h, 128, 128), "float32", (None, None, a, None, None)),
-            Spec("mla_key", (s, m, h, self.context, 256), "bfloat16", (None, None, a, None, None)),
-            Spec("mla_value", (s, m, h, self.context, 128), "bfloat16", (None, None, a, None, None)),
+            Spec("mla_key", (blocks, m, h, bs, 256), "bfloat16", (None, None, a, None, None)),
+            Spec("mla_value", (blocks, m, h, bs, 128), "bfloat16", (None, None, a, None, None)),
         ]
 
     def hidden_spec(self, rows):
@@ -190,19 +211,30 @@ class KimiAdapter:
         """``tiles.forward``'s kernel: one megakernel call on this rank's weights."""
         from kimi import decode_megakernel
 
+        import jax.numpy as jnp
+
+        aux_layers = tuple(self.drafter.c.aux_layers) if self.drafter else ()
+
         def call(states, tokens, positions, sequence_rows):
             options = {k: v for k, v in kernel_options(sequence_rows).items() if v is not None}
-            hidden, new_states = decode_megakernel.decode_local(
+            out = decode_megakernel.decode_local(
                 weights, states, tokens, positions, batch_size=tiles.TILE, layers=self.layers,
-                sequence_rows=sequence_rows, rank=rank, return_hidden=True, **options,
+                sequence_rows=sequence_rows, rank=rank, return_hidden=True, aux_hidden_layers=aux_layers,
+                **options,
             )
-            return hidden, new_states
+            if not aux_layers:
+                return out
+            # The drafter's context: the residual stream entering its layers, [layers, rows,
+            # hidden] -> [rows, layers * hidden], carried as extra hidden columns.
+            hidden, aux, new_states = out
+            aux = aux.transpose(1, 0, 2).reshape(tiles.TILE, -1).astype(jnp.bfloat16)
+            return jnp.concatenate([hidden.astype(jnp.bfloat16), aux], axis=1), new_states
 
         return call
 
     def forward_body(self, n_controls, n_constants, n_weights):
         names = [s.name for s in self.forward_param_specs()]
-        hidden_size = self.hidden
+        hidden_size, block_size, context = self.hidden, self.cfg.block_size, self.context
 
         def body(*args):
             controls = dict(zip(CONTROL_NAMES, args[:n_controls]))
@@ -211,7 +243,12 @@ class KimiAdapter:
             weights = {n: w[0] for n, w in zip(names, args[start: start + n_weights])}
             states = tuple(args[start + n_weights:])
             num_tokens = controls["input_ids"].shape[0]
-            states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, hidden_size)
+            width = hidden_size + (self.drafter.c.context_width if self.drafter else 0)
+            states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, width,
+                                           block_size=block_size, context=context,
+                                           sequence_rows=self.cfg.sequence_rows)
+            if self.drafter:
+                return (*states, hidden[:, :hidden_size], hidden[:, hidden_size:])
             return (*states, hidden)
 
         return body
@@ -237,7 +274,25 @@ class KimiAdapter:
     def constant_values(self):
         return {"rank": np.arange(TP, dtype=np.int32)}
 
-    def write_checkpoint(self, out, specs, axis_sizes, log=print, presharded=None, workers=2):
+    def write_checkpoint(self, out, specs, axis_sizes, log=print, presharded=None, workers=2, draft_only=False):
+        """Write ``serving_checkpoint``; ``draft_only`` adds just the drafter's arrays to an
+        existing one (they come after the model's, whose array numbers do not change)."""
+        from .checkpoint import CheckpointWriter
+
+        draft_names = {s.name for s in self.drafter.param_specs()} if self.drafter else set()
+        model_specs = [s for s in specs if s.name not in draft_names]
+        if list(specs[: len(model_specs)]) != model_specs:
+            raise ValueError("the drafter's arrays must follow the model's")
+        if draft_names:
+            writer = CheckpointWriter(out, specs, axis_sizes)
+            for name, value in self.drafter.tensors():
+                log(f"writing {name}")
+                writer.write(name, value)
+        if draft_only:
+            return
+        self._write_model_checkpoint(out, model_specs, axis_sizes, log, presharded, workers)
+
+    def _write_model_checkpoint(self, out, specs, axis_sizes, log, presharded, workers):
         from .kimi_checkpoint import write_from_presharded, write_megakernel_checkpoint
 
         if presharded is not None:

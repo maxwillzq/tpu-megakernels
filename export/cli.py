@@ -34,6 +34,14 @@ def build_parser():
     p.add_argument("--topology", default="tpu7x:2x2x4",
                    help="TPU topology to lower for (tpu7x:2x2x4: 16 chips, 32 devices, 4 hosts)")
     p.add_argument("--target-tpu", default="7x")
+    p.add_argument("--max-verify-tokens", type=int, default=7,
+                   help="draft tokens a step can verify (grammar-forced tokens: jump-forward decoding); "
+                        "each takes a recurrent checkpoint slot per sequence. 0 turns jump-forward "
+                        "decoding off; at most 7 (one 8-row sequence tile)")
+    p.add_argument("--sequence-rows", type=_ints, default=(),
+                   help="packed sequence-tile forms, e.g. 2,4: verify windows of up to 2 (4) tokens "
+                        "share one kernel call, 4 (2) per call; each form is one more kernel call in "
+                        "the forward graph")
     p.add_argument("--weights", choices=["checkpoint", "none"], default="checkpoint",
                    help="convert the checkpoint into serving_checkpoint, or write subgraphs only")
     p.add_argument("--presharded", help="read the weights from kimi.load's pre-sharded TP32 layout "
@@ -44,6 +52,10 @@ def build_parser():
                    help="write only serving_checkpoint (no lowering, no libtpu): e.g. on a CPU host, for "
                         "an artifact whose subgraphs were exported with --weights none")
     p.add_argument("--workers", type=int, default=2, help="ranks converted in parallel")
+    p.add_argument("--draft", help="DSpark speculator checkpoint directory (RedHatAI/Kimi-K3-speculator.dspark): "
+                   "also export it as rvllm's mtp_draft, drafting --max-verify-tokens tokens per step")
+    p.add_argument("--draft-weights-only", action="store_true",
+                   help="with --checkpoint-only: add only the drafter's arrays to an existing serving_checkpoint")
     return p
 
 
@@ -57,10 +69,11 @@ def main(argv=None):
         max_model_len=args.max_model_len, block_size=args.block_size, num_blocks=args.num_blocks,
         token_buckets=args.token_buckets, req_buckets=args.req_buckets, target_tpu=args.target_tpu,
         topology=args.topology, compile_check=args.compile_check,
+        max_verify_tokens=args.max_verify_tokens, sequence_rows=args.sequence_rows,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,
-                          model_name=args.checkpoint)
+                          model_name=args.checkpoint, draft=args.draft)
     if args.checkpoint_only:
         # abstract_params order: constants, then weights (export.exporter.Exporter.slots).
         specs, axis_sizes = adapter.constant_specs() + adapter.param_specs(), {adapter.axis: TP, "data": 1}
@@ -70,7 +83,8 @@ def main(argv=None):
         specs, axis_sizes = ex.checkpoint_specs(), ex.axis_sizes
     if args.weights == "checkpoint":
         adapter.write_checkpoint(args.checkpoint_dir or cfg.output_dir, specs, axis_sizes,
-                                 presharded=args.presharded, workers=args.workers)
+                                 presharded=args.presharded, workers=args.workers,
+                                 draft_only=args.draft_weights_only)
     print(f"wrote {cfg.output_dir}")
 
 

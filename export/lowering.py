@@ -58,6 +58,58 @@ def _add_aliasing(signature, aliases):
     return signature
 
 
+def _inline_hoisted_constants(text, spans):
+    """``shard_map`` passes the constants its body closes over (e.g. a ``jnp.asarray`` of a numpy
+    table) as leading ``@shmap_body`` parameters, which the global ``@main`` defines with
+    ``stablehlo.constant``. Only the body is kept, so move those constants into it."""
+    main = text[slice(*spans["main"])]
+    call = re.search(r"call @shmap_body\((.*?)\) :", main)
+    if call is None:
+        return text
+    defs = dict(re.findall(r"^\s*(%[\w#]+) = (.*)$", main, re.M))
+
+    def constant(value):
+        for _ in range(4):  # through the Sharding / SPMDFullToShardShape custom calls
+            line = defs.get(value, "")
+            if line.startswith("stablehlo.constant "):
+                return line
+            m = re.match(r"stablehlo\.custom_call @(?:Sharding|SPMDFullToShardShape)\((%[\w#]+)\)", line)
+            if m is None:
+                return None
+            value = m.group(1)
+        return None
+
+    operands = [o.strip() for o in call.group(1).split(",") if o.strip()]
+    hoisted = []
+    for operand in operands:
+        line = constant(operand)
+        if line is None:
+            break
+        hoisted.append(line)
+    if not hoisted:
+        return text
+    if any(constant(o) for o in operands[len(hoisted):]):
+        raise ValueError("@shmap_body takes a constant after a non-constant parameter")
+    start, end = spans["shmap_body"]
+    body = text[start:end]
+    n = len(hoisted)
+    sig = re.search(r"@shmap_body\((.*?)\) ->", body, re.S)
+    params = re.split(r",\s*(?=%arg\d+:)", sig.group(1))
+    body = body[: sig.start(1)] + ", ".join(params[n:]) + body[sig.end(1):]
+    # Constants first, after the function's opening line.
+    brace = body.index("{\n", body.index(") ->")) + 2
+    lines = "".join(f"    %hoisted{i} = {line}\n" for i, line in enumerate(hoisted))
+    body = body[:brace] + lines + body[brace:]
+
+    def rename(m):
+        i = int(m.group(1))
+        return f"%hoisted{i}" if i < n else f"%arg{i - n}"
+
+    head, rest = body[:brace], body[brace + len(lines):]
+    body = re.sub(r"%arg(\d+)\b", rename, head) + lines + re.sub(r"%arg(\d+)\b", rename, rest)
+    return text[:start] + body + text[end:]
+
+
 def shard_local_module(text, name, aliases=None):
     """Turn a GSPMD-lowered ``jit(shard_map(...))`` module into an artifact module.
 
@@ -68,6 +120,8 @@ def shard_local_module(text, name, aliases=None):
     spans = _functions(text)
     if "shmap_body" not in spans:
         raise ValueError("the lowered module has no @shmap_body: lower a jit(shard_map(...))")
+    text = _inline_hoisted_constants(text, spans)
+    spans = _functions(text)
     start, end = spans["main"]
     text = text[:start] + text[end:]
     text = text.replace("func.func private @shmap_body(", "func.func public @main(", 1)

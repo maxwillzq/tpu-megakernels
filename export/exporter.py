@@ -7,7 +7,11 @@ shard-local bodies. The artifact holds (RFC 0001):
 - ``forward_bucket{B}``: controls, the per-rank ``rank`` constant, weights and donated states
   -> updated states and ``hidden_states [B, H]``;
 - ``compute_logits_req{R}``: ``hidden_states [R, H]`` and the LM head -> ``logits [R, V]``;
-- the four sampler families per R (``export.sampling``).
+- the four sampler families per R (``export.sampling``);
+- with a drafter (``adapter.drafter``), ``mtp_draft_bucket{B}``: ``forward``'s controls with
+  rvllm's shifted ``input_ids``, ``last_token_indices``, the drafter's weights, the
+  intermediate ``forward`` returns for it and its donated paged KV -> that KV and
+  ``draft_tokens [max_num_seqs, k]``; ``serving_config.speculative_config`` declares it.
 """
 
 import contextlib
@@ -39,6 +43,8 @@ CONTROL_CONTRACT_NAMES = {
     "query_start_loc": "query_start_loc",
     "req_dist": "req_dist",
     "state_slots": "mamba_state_indices",
+    "mamba_ckpt_indices": "mamba_ckpt_indices",
+    "mamba_slot_read_offsets": "mamba_slot_read_offsets",
 }
 
 
@@ -197,10 +203,12 @@ class Exporter:
         in_specs = controls + constants + weights + states
         first_state = len(controls) + len(constants) + len(weights)
         hidden = a.hidden_spec(bucket)
+        drafter = getattr(a, "drafter", None)
+        extra = [drafter.aux_spec(bucket)] if drafter else []
         name = f"forward_bucket{bucket}"
         text = self._lower(
             a.forward_body(len(controls), len(constants), len(weights)),
-            in_specs, states + [hidden], name,
+            in_specs, states + [hidden] + extra, name,
             {first_state + i: i for i in range(len(states))},
             compile_check=cfg.compile_check,
         )
@@ -217,6 +225,53 @@ class Exporter:
             arg += 1
         outputs = [_output(s, i, "state", index=i) for i, s in enumerate(states)]
         outputs.append(_output(hidden, len(states), "intermediate", name="hidden_states"))
+        for i, s in enumerate(extra):
+            outputs.append(_output(s, len(states) + 1 + i, "intermediate"))
+        return {
+            "file_path": self._write(name, text),
+            "subgraph_index": 0,
+            "compile_size": bucket,
+            "inputs": inputs,
+            "outputs": outputs,
+        }
+
+    def mtp_draft(self, bucket):
+        a, cfg = self.adapter, self.cfg
+        d = a.drafter
+        from .dspark_draft import CONTROLS
+
+        by_name = {s.name: s for s in a.control_specs(bucket)}
+        controls = [by_name[n] for n in CONTROLS] + d.control_specs()
+        slot_of = {s.name: idx for idx, s, _ in self.slots()}
+        constants = a.constant_specs()
+        weights = d.param_specs()
+        aux = d.aux_spec(bucket)
+        states = d.state_specs()
+        in_specs = controls + constants + weights + [aux] + states
+        first_state = len(in_specs) - len(states)
+        tokens = d.tokens_spec()
+        name = f"mtp_draft_bucket{bucket}"
+        text = self._lower(
+            d.body(len(CONTROLS), len(constants), len(weights)), in_specs, states + [tokens], name,
+            {first_state + i: i for i in range(len(states))}, compile_check=cfg.compile_check,
+        )
+        inputs = [_entry(s, i, i, "user_io", name=CONTROL_CONTRACT_NAMES.get(s.name, s.name))
+                  for i, s in enumerate(controls)]
+        arg = len(controls)
+        for kind, specs in (("constant", constants), ("weight", weights)):
+            for s in specs:
+                inputs.append(_entry(s, arg, slot_of[s.name], kind, weight=kind == "weight"))
+                arg += 1
+        inputs.append(_entry(aux, arg, 0, "intermediate"))
+        arg += 1
+        # State indices continue after forward's: rvllm takes the states forward does not as the
+        # drafter's pools.
+        base = len(a.state_specs())
+        for i, s in enumerate(states):
+            inputs.append(_entry(s, arg, base + i, "state", donor=True))
+            arg += 1
+        outputs = [_output(s, i, "state", index=base + i) for i, s in enumerate(states)]
+        outputs.append(_output(tokens, len(states), "user_io"))
         return {
             "file_path": self._write(name, text),
             "subgraph_index": 0,
@@ -276,6 +331,12 @@ class Exporter:
         for b in cfg.token_buckets:
             log(f"lowering forward_bucket{b}")
             functions["forward"][str(b)] = self.forward(b)
+        drafter = getattr(a, "drafter", None)
+        if drafter:
+            functions["mtp_draft"] = {}
+            for b in cfg.token_buckets:
+                log(f"lowering mtp_draft_bucket{b}")
+                functions["mtp_draft"][str(b)] = self.mtp_draft(b)
         functions["compute_logits"] = {}
         for r in cfg.req_buckets:
             log(f"lowering compute_logits_req{r} and samplers")
@@ -296,6 +357,8 @@ class Exporter:
             "pipeline_parallel_size": 1,
             "data_parallel_size": 1,
         }
+        if drafter:
+            serving["speculative_config"] = {"method": "mtp", "num_speculative_tokens": drafter.k}
         serving.update(a.write_companion_files(self.out))
         metadata = {
             "format_version": 2,
