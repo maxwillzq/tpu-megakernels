@@ -30,6 +30,12 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
     subgraphs come from a separate `--weights none` export.
 - **Bring-up.** `--layers N` exports the first N layers (2..93). With `--presharded`, the stacked
   families keep their first entries.
+- **Gate/up format.** `--gate-up fp8` (default) stores the routed gate/up experts the way
+  `kimi.load` puts them on device: FP8 with BF16 block scales, reblocked from MXFP4 without
+  loss. The kernel then skips the MXFP4 unpack, but the weights take twice the bytes (about
+  78 GB per device, 2.5 TB in total). `--gate-up mxfp4` keeps the checkpoint's packed MXFP4
+  (about 51 GB per device, 1.65 TB), which leaves more HBM for slots and context. Which one is
+  faster is a TPU measurement.
 - **Recipe.** `--recipe plain` (default) uses the public demo's plain kernel options. `tuned`
   uses its batch-8 tuning, minus the sequence-parallel epilogue.
 

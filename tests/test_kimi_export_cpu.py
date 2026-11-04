@@ -22,8 +22,8 @@ FIXTURE = Path(__file__).parent / "data" / "k3_headers"
 LAYERS, SEQS = 4, 8
 
 
-@pytest.fixture(scope="module")
-def artifact(tmp_path_factory):
+@pytest.fixture(scope="module", params=["fp8", "mxfp4"])
+def artifact(request, tmp_path_factory):
     src = tmp_path_factory.mktemp("k3") / "ckpt"
     shutil.copytree(FIXTURE, src)
     vocab = {f"t{i}": i for i in range(16)}
@@ -35,15 +35,15 @@ def artifact(tmp_path_factory):
     out = tmp_path_factory.mktemp("art")
     cfg = api.ExportConfig(str(out), TP, max_num_seqs=SEQS, max_model_len=512, block_size=128,
                            num_blocks=40, token_buckets=(8, 16), topology="tpu7x:2x2x4")
-    adapter = KimiAdapter(HeaderCheckpoint(src, LAYERS), cfg, layers=LAYERS)
+    adapter = KimiAdapter(HeaderCheckpoint(src, LAYERS), cfg, layers=LAYERS, gate_up=request.param)
     meta = exporter.Exporter(adapter, cfg).export(log=lambda *_: None)
     return out, meta, adapter
 
 
 def test_weights_are_the_megakernel_layout(artifact):
-    _, meta, _ = artifact
+    _, meta, adapter = artifact
     shapes = load.selected_local_shapes(LAYERS)
-    fp8 = load.fp8_expert_shapes(LAYERS)
+    fp8 = load.fp8_expert_shapes(LAYERS) if adapter.gate_up == "fp8" else {}
     inputs = meta["functions"]["abstract_params"]["default"]["inputs"]
     weights = {e["name"]: e for e in inputs if e["is_weight"]}
     assert set(weights) == set(shapes)
@@ -52,7 +52,8 @@ def test_weights_are_the_megakernel_layout(artifact):
         shape = fp8[name][0] if name in fp8 else shape
         assert weights[name]["shape"] == [TP, *shape], name
         assert weights[name]["sharding"] == ["model"] + [None] * len(shape), name
-    assert weights["expert_gu"]["dtype"] == "f8E4M3FN"
+    assert weights["expert_gu"]["dtype"] == ("f8E4M3FN" if adapter.gate_up == "fp8" else "ui32")
+    assert weights["expert_gus"]["dtype"] == ("bf16" if adapter.gate_up == "fp8" else "ui8")
 
 
 def test_forward_runs_the_megakernel_shard_local(artifact):

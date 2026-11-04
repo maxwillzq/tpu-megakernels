@@ -27,6 +27,9 @@ def build_parser():
     p.add_argument("--req-buckets", type=_ints, default=())
     p.add_argument("--recipe", choices=["plain", "tuned"], default="plain",
                    help="megakernel options: the demo's plain path, or its batch-8 tuning")
+    p.add_argument("--gate-up", choices=["fp8", "mxfp4"], default="fp8",
+                   help="routed gate/up storage: FP8 with BF16 block scales (no in-kernel MXFP4 unpack, "
+                        "twice the bytes) or the checkpoint's packed MXFP4 (half the HBM and artifact size)")
     p.add_argument("--topology", default="tpu7x:2x2x4",
                    help="TPU topology to lower for (tpu7x:2x2x4: 16 chips, 32 devices, 4 hosts)")
     p.add_argument("--target-tpu", default="7x")
@@ -55,7 +58,8 @@ def main(argv=None):
         topology=args.topology,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
-    adapter = KimiAdapter(source, cfg, layers=args.layers, recipe=args.recipe, model_name=args.checkpoint)
+    adapter = KimiAdapter(source, cfg, layers=args.layers, recipe=args.recipe, gate_up=args.gate_up,
+                          model_name=args.checkpoint)
     if args.checkpoint_only:
         # abstract_params order: constants, then weights (export.exporter.Exporter.slots).
         specs, axis_sizes = adapter.constant_specs() + adapter.param_specs(), {adapter.axis: TP, "data": 1}

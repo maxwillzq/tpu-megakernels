@@ -27,6 +27,9 @@ EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 # The public demo's kernel options (demo_kimi_dspark.decode_options).
 KERNEL_DEFAULTS = ("mla_cache_write_in_attend", "mla_pv_mxu_hilo")
 RECIPES = ("plain", "tuned")
+# Routed gate/up storage: FP8 with BF16 block scales (the loader's reblock: no in-kernel MXFP4
+# unpack, twice the bytes), or the checkpoint's packed MXFP4 (half the HBM and artifact size).
+GATE_UP_FORMATS = ("fp8", "mxfp4")
 
 
 def kernel_options(recipe, sequence_rows):
@@ -95,17 +98,19 @@ class HeaderCheckpoint(load.Checkpoint):
         return value if selection is None else value[selection]
 
 
-def weight_layout(checkpoint, layers):
+def weight_layout(checkpoint, layers, gate_up="fp8"):
     """``{name: (local shape, dtype name)}`` in ``kimi.load``'s selected layout and order."""
+    if gate_up not in GATE_UP_FORMATS:
+        raise ValueError(f"gate_up must be one of {GATE_UP_FORMATS}")
     shapes = load.selected_local_shapes(layers, checkpoint.config.dim, vocab=checkpoint.config.vocab)
-    fp8 = load.fp8_expert_shapes(layers)
+    fp8 = load.fp8_expert_shapes(layers) if gate_up == "fp8" else {}
     out = {}
     for name, shape in shapes.items():
         if name in fp8:
             shape, dtype = fp8[name]
             out[name] = (tuple(shape), np.dtype(dtype).name)
-        elif name in ("expert_down", "expert_ds"):
-            out[name] = (tuple(shape), "uint32" if name == "expert_down" else "uint8")
+        elif name in EXPERT_FAMILIES:  # packed MXFP4 and its E8M0 scales
+            out[name] = (tuple(shape), "uint32" if name in ("expert_gu", "expert_down") else "uint8")
         else:
             ids = load._family_layers(checkpoint.config, name, layers)
             value = checkpoint.dense_selected(name, 0 if ids is None else ids[0], 0)
@@ -117,7 +122,8 @@ class KimiAdapter:
     axis = "model"  # metadata axis (rvllm's)
     mesh_axis = "tp"  # the megakernel's shard_map axis
 
-    def __init__(self, checkpoint, cfg, *, layers=93, recipe="plain", model_name="kimi-k3", kernel=None):
+    def __init__(self, checkpoint, cfg, *, layers=93, recipe="plain", gate_up="fp8", model_name="kimi-k3",
+                 kernel=None):
         if cfg.tp != TP:
             raise ValueError("the Kimi megakernel is TP32")
         if cfg.max_num_seqs < 1:
@@ -129,7 +135,8 @@ class KimiAdapter:
         self.vocab_size = checkpoint.config.vocab
         self.hidden = checkpoint.config.dim
         self.eos_token_id = self._checkpoint_eos()
-        self.weights = weight_layout(checkpoint, layers)
+        self.gate_up = gate_up
+        self.weights = weight_layout(checkpoint, layers, gate_up)
         self.context = cache_length(cfg.max_model_len)
         self._kernel = kernel
 
@@ -243,12 +250,12 @@ class KimiAdapter:
 
         if presharded is not None:
             write_from_presharded(presharded, self.checkpoint.config, self.layers, out, specs, axis_sizes,
-                                  self.constant_values(), log, workers=workers)
+                                  self.constant_values(), log, workers=workers, gate_up=self.gate_up)
             return
         if not self.checkpoint.has_weights:
             raise ValueError(f"{self.source} has headers only; export with --weights none")
         write_megakernel_checkpoint(self.checkpoint, self.layers, out, specs, axis_sizes,
-                                    self.constant_values(), log)
+                                    self.constant_values(), log, gate_up=self.gate_up)
 
     # Companion files.
     def write_companion_files(self, out):

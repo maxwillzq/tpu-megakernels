@@ -4,6 +4,7 @@ device ``r``, and the gate/up FP8 reblock is lossless."""
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import pytest
 import tensorstore as ts
 
 import kimi
@@ -101,7 +102,8 @@ def _write_presharded(root, rng):
     return values
 
 
-def test_presharded_prefix_conversion(tmp_path):
+@pytest.mark.parametrize("gate_up", ["fp8", "mxfp4"])
+def test_presharded_prefix_conversion(tmp_path, gate_up):
     from export.kimi_checkpoint import write_from_presharded
 
     rng = np.random.default_rng(1)
@@ -114,13 +116,15 @@ def test_presharded_prefix_conversion(tmp_path):
              Spec("m_qnorm", (TP, 1, 1, 8), bf16, ("model", None, None, None)),
              Spec("attn_res", (TP, 4, 1, 8), "float32", ("model", None, None, None)),
              Spec("embedding", (TP, 4, 8), bf16, ("model", None, None)),
-             Spec("expert_gu", (TP, 3, 1, 256, 2), "float8_e4m3fn", ("model",) + (None,) * 4),
-             Spec("expert_gus", (TP, 3, 1, 1, 2), bf16, ("model",) + (None,) * 4),
+             Spec("expert_gu", (TP, 3, 1, 256, 2), "float8_e4m3fn", ("model",) + (None,) * 4)
+             if gate_up == "fp8" else Spec("expert_gu", (TP, 3, 1, 32, 2), "uint32", ("model",) + (None,) * 4),
+             Spec("expert_gus", (TP, 3, 1, 1, 2), bf16, ("model",) + (None,) * 4)
+             if gate_up == "fp8" else Spec("expert_gus", (TP, 3, 1, 8, 2), "uint8", ("model",) + (None,) * 4),
              Spec("expert_down", (TP, 3, 1, 6, 2), "uint32", ("model",) + (None,) * 4),
              Spec("expert_ds", (TP, 3, 1, 3, 2), "uint8", ("model",) + (None,) * 4)]
     out = tmp_path / "art"
     write_from_presharded(tmp_path / "pre", kimi.Config(), layers, out, specs, {"model": TP},
-                          {"rank": np.arange(TP, dtype=np.int32)}, log=lambda *_: None)
+                          {"rank": np.arange(TP, dtype=np.int32)}, log=lambda *_: None, gate_up=gate_up)
 
     def read(i):
         return np.asarray(ts.open({"driver": "zarr", "kvstore": {
@@ -140,6 +144,11 @@ def test_presharded_prefix_conversion(tmp_path):
             want = want if keep[spec.name] is None else want[: keep[spec.name]]
             np.testing.assert_array_equal(got[rank], want, err_msg=spec.name)
     gu, gus = read(6), read(7)
+    if gate_up == "mxfp4":  # stored as the checkpoint packs it
+        for rank in (0, 31):
+            np.testing.assert_array_equal(gu[rank], values[rank, "expert_gu"][:3])
+            np.testing.assert_array_equal(gus[rank], values[rank, "expert_gus"][:3])
+        return
     for rank in (0, 31):
         for layer in range(3):
             encoded, coarse = _reblock(values[rank, "expert_gu"][layer], values[rank, "expert_gus"][layer])

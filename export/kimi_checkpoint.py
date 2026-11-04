@@ -31,7 +31,16 @@ def _reblock(gate_up, scales):
     return np.asarray(encoded), np.asarray(coarse)
 
 
-def write_megakernel_checkpoint(checkpoint, layers, out, specs, axis_sizes, constants, log=print):
+def _gate_up(gate_up, packed, scales):
+    """The stored gate/up pair: FP8 reblocked from MXFP4, or the packed MXFP4 as is."""
+    if gate_up == "fp8":
+        return _reblock(packed, scales)
+    return np.asarray(packed, np.uint32), np.asarray(scales, np.uint8)
+
+
+def write_megakernel_checkpoint(checkpoint, layers, out, specs, axis_sizes, constants, log=print,
+                                gate_up="fp8"):
+    gate_up_format = gate_up  # `gate_up` names each layer's packed experts below
     writer = CheckpointWriter(out, specs, axis_sizes)
     config = checkpoint.config
     names = {s.name for s in specs}
@@ -59,7 +68,7 @@ def write_megakernel_checkpoint(checkpoint, layers, out, specs, axis_sizes, cons
                 gate_up, gate_up_scales, down, down_scales = checkpoint.experts(
                     layer, per_rank * (rank // 4), per_rank, part=rank % 4, parts=4
                 )
-                encoded, coarse = _reblock(gate_up, gate_up_scales)
+                encoded, coarse = _gate_up(gate_up_format, gate_up, gate_up_scales)
                 region = (slice(rank, rank + 1), slice(i, i + 1))
                 writer.write("expert_gu", encoded[None, None], region)
                 writer.write("expert_gus", coarse[None, None], region)
@@ -103,7 +112,8 @@ class _Store:
         return json.loads(self.read(name))
 
 
-def write_from_presharded(path, config, layers, out, specs, axis_sizes, constants, log=print, workers=2):
+def write_from_presharded(path, config, layers, out, specs, axis_sizes, constants, log=print, workers=2,
+                          gate_up="fp8"):
     """Convert ``kimi.load``'s pre-sharded TP32 layout (93 layers; a directory or ``gs://``
     prefix) into ``specs`` for a ``layers``-layer prefix: stacked families keep their first
     entries (``kimi.load`` orders them by layer), and only those bytes are read."""
@@ -136,7 +146,7 @@ def write_from_presharded(path, config, layers, out, specs, axis_sizes, constant
             writer.write(name, value[None], (slice(rank, rank + 1),))
         for i in range(layers - 1):
             layer = {n: _expert_layer(store, rank_dir, index[n], i, array) for n in EXPERT_FAMILIES}
-            encoded, coarse = _reblock(layer["expert_gu"], layer["expert_gus"])
+            encoded, coarse = _gate_up(gate_up, layer["expert_gu"], layer["expert_gus"])
             region = (slice(rank, rank + 1), slice(i, i + 1))
             writer.write("expert_gu", encoded[None, None], region)
             writer.write("expert_gus", coarse[None, None], region)
