@@ -22,13 +22,25 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
   `model.safetensors.index.json`, the tokenizer and `headers.json` (every tensor's safetensors
   header entry) is enough for that.
 - **Weight source.** `--presharded DIR` reads the weights from `kimi.load`'s pre-sharded TP32
-  layout (`rank??/dense.bin` and expert files) instead of the Hugging Face checkpoint. It is
-  faster, because the layout is already per rank. `--checkpoint-dir gs://...` writes
-  `serving_checkpoint` straight to GCS.
+  layout (`rank??/dense.bin` and expert files) instead of the Hugging Face checkpoint.
+  - It is faster, because the layout is already per rank.
+  - `DIR` may be a `gs://` prefix; only the needed byte ranges are read.
+  - `--checkpoint-dir gs://...` writes `serving_checkpoint` straight to GCS.
+  - `--checkpoint-only` skips lowering (no libtpu needed), for converting on a CPU host. The
+    subgraphs come from a separate `--weights none` export.
 - **Bring-up.** `--layers N` exports the first N layers (2..93). With `--presharded`, the stacked
   families keep their first entries.
 - **Recipe.** `--recipe plain` (default) uses the public demo's plain kernel options. `tuned`
   uses its batch-8 tuning, minus the sequence-parallel epilogue.
+
+For example, the subgraphs on any host and the weights on a large CPU host:
+
+```bash
+python -m export kimi --checkpoint K3_DIR --output-dir ART --weights none --max-num-seqs 32 \
+  --max-model-len 4096 --num-blocks 1056
+python -m export kimi --checkpoint K3_DIR --output-dir /tmp/unused --checkpoint-only --num-blocks 1 \
+  --presharded gs://cloud-devkit/ckpt/presharded/kimi-k3-tp32 --checkpoint-dir ART/ --workers 6
+```
 
 ## How a step runs
 
