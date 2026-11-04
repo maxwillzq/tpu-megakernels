@@ -47,6 +47,8 @@ class CheckpointWriter:
                     chunks[d] = spec.shape[d] // self.axis_sizes[axis]
             if len(spec.shape) >= 3:
                 chunks[0] = 1  # stacked layer families: one layer per chunk
+                if spec.sharding[0] is not None and len(spec.shape) >= 4:
+                    chunks[1] = 1  # per-rank stacked families [ranks, layers, ...]: one rank's layer
             self.arrays[name] = ts.open(
                 {
                     "driver": "zarr",

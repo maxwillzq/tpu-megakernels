@@ -1,125 +1,122 @@
-# Exporting models as rvllm artifacts
+# Exporting the Kimi K3 megakernel as an rvllm artifact
 
-`python -m export` turns a model in this repository into an rvllm artifact: shard-local
-StableHLO subgraphs, `metadata.json`, a `serving_checkpoint`, and the tokenizer files. rvllm
-then serves it with continuous batching, paged KV and its OpenAI frontend. The layout follows
-vllm-torchtpu's `experimental/export`.
-
-Kimi K3 is supported today.
+`python -m export kimi` packages the TP32 Kimi K3 decode megakernel (`kimi.decode_megakernel`)
+as an rvllm artifact: shard-local StableHLO subgraphs, `metadata.json`, a `serving_checkpoint`
+and the tokenizer files. rvllm then serves it with continuous batching and its OpenAI frontend;
+every forward step runs the megakernel. The layout follows vllm-torchtpu's
+`experimental/export`.
 
 ## Usage
 
 ```bash
-# Tiny random model (tests, smoke runs on CPU):
-JAX_PLATFORMS=cpu python -m export kimi --tiny --tp 2 --output-dir /tmp/kimi-tiny \
-  --max-num-seqs 4 --max-model-len 64 --block-size 16 --num-blocks 32 --token-buckets 16,32
+pip install "jax[tpu]"   # libtpu: lowers for a TPU topology on any host, no TPU needed
 
-# Kimi K3 from its Hugging Face checkpoint (32-way tensor parallel, as the megakernel):
-JAX_PLATFORMS=cpu python -m export kimi --checkpoint /path/to/Kimi-K3 --tp 32 \
-  --output-dir /path/to/kimi-k3-tp32 --max-num-seqs 32 --max-model-len 8192 \
-  --block-size 128 --num-blocks 2048 --token-buckets 16,32,64,128,256,512
+python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k3-megakernel \
+  --max-num-seqs 32 --max-model-len 4096 --num-blocks 1056 --token-buckets 8,16,32,64,128
 ```
 
-- Lowering runs on CPU. By default it lowers for `--tp` virtual CPU devices (the CLI sets
-  `--xla_force_host_platform_device_count`). `--topology tpu7x:4x4x2` lowers for an abstract TPU
-  topology instead (`jax.experimental.topologies`; needs libtpu, `pip install "jax[tpu]"`, but no
-  TPU). The pure-JAX forward gives the same StableHLO either way; the topology is what lets Pallas
-  TPU kernels such as the megakernel lower, as `tpu_custom_call`. `tpu7x:4x4x2` has 32 devices
-  (16 chips, two TensorCores each).
-- `--weights none` writes the subgraphs and metadata only. rvllm serves such an artifact with
-  `--load-format dummy`. `--weights checkpoint` (the default with `--checkpoint`) converts the
-  checkpoint; `--weights random` writes random weights.
-- `--layers N` keeps the first N layers (bring-up).
-- `--expert-format mxfp4` (default for checkpoints) keeps routed experts in MXFP4 and
-  dequantizes them in the graph; `bf16` dequantizes at export.
-- The full K3 lowers in about 40 s for four forward buckets. Its weights are about 1.6 TB, so it
-  needs `--tp 32` (about 50 GB per device plus replicated tensors).
+- **Topology.** Lowering targets `--topology tpu7x:2x2x4` (16 chips, 32 TensorCores, 4 hosts),
+  the megakernel's TP32 slice.
+- **Weights.** `--weights none` writes the subgraphs and metadata only (about 30 s for the full
+  model). A checkpoint directory holding only `config.json`,
+  `model.safetensors.index.json`, the tokenizer and `headers.json` (every tensor's safetensors
+  header entry) is enough for that.
+- **Bring-up.** `--layers N` exports the first N layers (2..93).
+- **Recipe.** `--recipe plain` (default) uses the public demo's plain kernel options. `tuned`
+  uses its batch-8 tuning, minus the sequence-parallel epilogue.
 
-Serve on TPU with `rvllm serve <artifact>`. On CPU, for checks, point `LIBTPU_PATH` at the PJRT
-CPU plugin and pass `--pjrt-cpu-device-count <tp>`.
+## How a step runs
 
-## What is in an artifact
+The megakernel processes one tile of eight rows per call, in one of two forms:
 
-| Subgraph | Inputs | Outputs |
+- **Decode tile:** up to eight sequences, one token each.
+- **Sequence tile:** eight consecutive tokens of one sequence. This is the
+  speculative-verification form, and the megakernel's own server prefills with it.
+
+rvllm sends a ragged batch instead: request `r` owns tokens `query_start_loc[r] :
+query_start_loc[r+1]`, and its states live in slot `mamba_state_indices[r]`. `export/tiles.py`
+bridges the two inside the forward graph:
+- requests with one token go through decode tiles;
+- longer requests (prefill, chunked prefill) go through sequence tiles, eight tokens at a time,
+  in order;
+- each call gathers its rows' slots, runs the kernel, and scatters back what changed (the KDA
+  states, and only the cache positions the call wrote);
+- a sequence starting at position 0 starts from zero KDA states, because rvllm reuses slots.
+
+Each `forward_bucket{B}` therefore contains two megakernel calls (`tpu_custom_call`), each in a
+loop whose trip count depends on the batch.
+
+States, all addressed by slot (rvllm treats a state as recurrent when its leading dimension is
+`num_state_slots = max_num_seqs + 1`; slot 0 is the null slot):
+
+| State | Global shape | Kernel layout per rank |
 | :--- | :--- | :--- |
-| `abstract_params` | every weight and the per-rank `rank` constant, donated | the same |
-| `forward_bucket{B}` | `input_ids`, `positions`, `kv_lens`, `block_tables`, `query_start_loc`, `req_dist`, `mamba_state_indices`; `rank`; weights; states | states, `hidden_states [B, H]` |
-| `compute_logits_req{R}` | `hidden_states [R, H]`, `lm_head` | `logits [R, V]` |
-| `sample_tokens*_req{R}` | `logits` plus per-row sampling inputs | `tokens [R, 1]` |
+| `kda_conv` | `[slots, 69, 3, 96, 3, 128]` bf16 | q/k/v short-conv history, 3 heads |
+| `kda_state` | `[slots, 69, 96, 128, 128]` f32 | KDA recurrent state |
+| `mla_key` | `[slots, 24, 96, C, 256]` bf16 | per-head MLA keys |
+| `mla_value` | `[slots, 24, 96, C, 128]` bf16 | per-head MLA values |
 
-Kimi K3 keeps three states:
+`C` is `max_model_len + 8` rounded up to 128: a sequence tile may write up to seven positions past
+a sequence's last token. Those entries are never read before a later step overwrites them.
 
-| State | Shape | Addressed by |
-| :--- | :--- | :--- |
-| `mla_cache` | `[num_blocks, 24, block_size, 576]` bf16: each MLA layer's normalized KV latent and shared key extra | `block_tables` (paged) |
-| `kda_conv` | `[num_state_slots, 69, 3, 3, heads, 128]` bf16: KDA short-conv history | `mamba_state_indices` |
-| `kda_state` | `[num_state_slots, 69, heads, 128, 128]` f32: KDA recurrent state | `mamba_state_indices` |
+Weights are `kimi.load`'s selected per-rank layout (TP4 x EP8 experts, gate/up in FP8 with BF16
+block scales), stored as `[32, *local]` arrays split over ranks. Rank `r`'s slab is exactly what
+`kimi.load.load_weights` puts on device `r`.
 
-`num_state_slots` is `max_num_seqs + 1`; slot 0 and block 0 are null sinks for padding.
+## Device order
+
+The megakernel moves data between devices with remote DMAs addressed by mesh position, so:
+- the artifact pins `compile_options.device_assignment` to the mesh order it was lowered for
+  (`_logical_mesh("0,1,2,3,4")`: devices by host, then id);
+- the forward takes each rank's index as data (the `rank` constant), because rvllm's contract
+  forbids `partition_id`. `decode_local(rank=...)` uses it in place of `axis_index`.
 
 ## Layout
 
 | Module | Role |
 | :--- | :--- |
-| `api.py` | `ExportConfig`: capacities and buckets |
+| `api.py` | `ExportConfig`: capacities, buckets, topology |
+| `spec.py` | tensor specs, the forward's control inputs |
 | `lowering.py` | lowers `jit(shard_map(body))` under the GSPMD partitioner and keeps its per-device `@shmap_body` as `@main` |
 | `exporter.py` | assembles the subgraphs and `metadata.json`, and checks each `@main` against the declared shard-local shapes |
+| `tiles.py` | ragged, slot-addressed batch -> megakernel tiles |
+| `kimi.py` | Kimi adapter: weight and state specs, the forward and logits bodies, companion files |
+| `kimi_checkpoint.py` | Hugging Face checkpoint -> the megakernel's per-rank weights |
 | `sampling.py` | JAX ports of vllm-torchtpu's samplers |
 | `checkpoint.py` | writes `serving_checkpoint` as zarr v2 arrays, by region |
-| `kimi.py` | Kimi K3 adapter: specs, shard-local bodies, companion files |
-| `kimi_checkpoint.py` | Hugging Face K3 checkpoint to export layout |
-| `tokenizer.py` | tiktoken to `tokenizer.json` |
+| `tokenizer.py` | tiktoken -> `tokenizer.json` |
 | `kimi_chat_template.jinja` | K3 chat rendering (K3 ships it as Python) |
-| `cli.py` | `python -m export` |
-
-The model itself is `kimi/model.py`: a pure-JAX Kimi K3 forward over a ragged, paged batch,
-written for one tensor-parallel rank inside `shard_map`.
-
-Points that matter when lowering:
-- **No device ids in the graph.** rvllm's contract forbids `partition_id`, so each rank's index
-  comes in as data (the `rank` constant, global `[tp]`, one value per rank).
-- **No closed-over JAX arrays.** A concrete JAX array captured by the body becomes an extra
-  parameter of `@shmap_body`. Use NumPy scalars or in-graph arithmetic instead; the signature
-  check catches it.
-- **No CHLO.** `lax.top_k` lowers to `chlo.top_k`; expert routing uses a stable sort, which
-  lowers to `stablehlo.sort`.
 
 ## Tests
 
 ```bash
-JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-  pytest tests/test_kimi_model_cpu.py tests/test_kimi_export_cpu.py \
-         tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py \
-         tests/test_export_topology_cpu.py
+JAX_PLATFORMS=cpu pytest tests/test_export_tiles_cpu.py tests/test_kimi_export_cpu.py \
+  tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py tests/test_export_topology_cpu.py
 ```
 
-- `test_kimi_model_cpu.py`: the ragged, paged forward against an independent per-token
-  reference (`tests/kimi_naive.py`) at tp 1 and 2, bf16 and MXFP4 experts. It covers mixed
-  prefill/decode steps, chunked prefill and slot/page reuse.
-- `test_kimi_export_cpu.py`: the exported artifact's executables, donation, shard-local types
-  and checkpoint. With `RVLLM_BIN` and `PJRT_CPU_LIB_PATH` set, it also serves the artifact with
-  rvllm on CPU and checks the greedy tokens against the reference.
-- `test_kimi_checkpoint_cpu.py`: Hugging Face checkpoint conversion, as a bit-exact round trip.
-- `test_export_topology_cpu.py`: lowering for an abstract TPU topology; a Pallas kernel comes out
-  shard-local as `tpu_custom_call` (skipped without libtpu).
-- `test_kimi_tokenizer_cpu.py`: the converted tokenizer encodes like tiktoken, and the chat
-  template renders `openai_server.render_chat_tokens`' tokens.
+- `test_export_tiles_cpu.py`: `tiles.forward` with a stand-in kernel that has the megakernel's
+  state contract, against token-by-token execution. It covers mixed decode and prefill steps,
+  chunks that do not fill a tile, and slot reuse.
+- `test_export_tiles_rvllm_cpu.py`: rvllm serves a toy artifact with the same structure on CPU.
+  Concurrent greedy requests must give the reference's tokens. Run it in the rvllm-dev image with
+  `RVLLM_BIN` and `PJRT_CPU_LIB_PATH` set.
+- `test_kimi_export_cpu.py`: exports a 4-layer megakernel prefix for `tpu7x:2x2x4`. It checks the
+  weight layout, the two kernel calls per forward, donation, shard-local types and the device
+  assignment.
+- `test_kimi_checkpoint_cpu.py`: rank slabs of the converted checkpoint, and the lossless FP8
+  reblock.
+- `test_kimi_tokenizer_cpu.py`: the converted tokenizer and the chat template.
 
-Checked against the published Kimi K3 checkpoint:
-- the converter reads exactly its 497,052 text-model tensors, with the expected shapes and
-  dtypes;
-- the converted tokenizer encodes like its tiktoken tokenizer;
-- the chat template matches the server's rendering.
+Checked against the published checkpoint's headers: the full 93-layer artifact exports in about
+30 s and passes vllm-torchtpu's validator.
 
-## Limitations
+## Limitations and next steps
 
-The forward is a pure-XLA reference implementation; it is correct, not fast.
-- **MoE:** each rank runs all its local experts on every token, masked by the routing
-  weights, instead of a grouped matmul.
-- **MLA attention:** loops over KV pages with an online softmax.
-- **KDA recurrence:** scans token by token.
-- **Next steps:** use the decode megakernel (or Pallas paged-attention and grouped-matmul
-  kernels) for the forward buckets. This needs the megakernel to address KV and recurrent state
-  by slot and page rather than by its own contiguous per-sequence cache.
-- **Not exported:** DSpark speculative decoding and the vision tower.
-- **Not yet validated on TPU:** the full model with real weights.
+- **Gathered states.** Each call gathers its rows' MLA caches (`[rows, 24, 3, C, 384]` per
+  rank) out of the slot arrays, because the kernel reads caches by tile row. Next: give the
+  kernel's cache DMAs a row-to-slot table, which removes the gather.
+- **Prefill.** Prefill runs eight tokens per call, as in the megakernel's own server, so long
+  prompts are slow. A batched prefill kernel would be a separate subgraph.
+- **Not exported:** DSpark speculative decoding, and the `tuned` recipe's sequence-parallel
+  epilogue.
+- **Not yet validated on TPU:** numerics and performance need a `tpu7x:2x2x4` slice.

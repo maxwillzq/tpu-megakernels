@@ -128,7 +128,17 @@ class Exporter:
                 f"lowering for tp={cfg.tp} needs {cfg.tp} devices; pass a larger topology, or "
                 f"on CPU set XLA_FLAGS=--xla_force_host_platform_device_count={cfg.tp}"
             )
-        self.mesh = Mesh(np.array(devices[: cfg.tp]), (adapter.axis,))
+        if hasattr(adapter, "device_assignment"):
+            # The adapter's programs address devices by mesh position (e.g. remote DMAs), so
+            # the artifact pins the device order it was lowered for.
+            if cfg.topology is None:
+                raise ValueError(f"{type(adapter).__name__} must be lowered for a TPU topology (--topology)")
+            devices = adapter.device_assignment(devices)
+            self.device_assignment = [int(d.id) for d in devices]
+        else:
+            self.device_assignment = None
+        self.mesh_axis = getattr(adapter, "mesh_axis", adapter.axis)
+        self.mesh = Mesh(np.array(devices[: cfg.tp]), (self.mesh_axis,))
         self.axis_sizes = {adapter.axis: cfg.tp, "data": 1}
         self.out = Path(cfg.output_dir)
         self.sub = self.out / "subgraphs"
@@ -146,11 +156,14 @@ class Exporter:
         (self.sub / f"{name}.mlir").write_text(text)
         return f"subgraphs/{name}.mlir"
 
+    def _partition(self, spec):
+        return P(*(self.mesh_axis if a == self.adapter.axis else a for a in spec.sharding))
+
     def _lower(self, fn, in_specs, out_specs, name, aliases=None, out_partition=None):
         text = lowering.lower(
             fn, self.mesh,
-            tuple(P(*s.sharding) for s in in_specs),
-            out_partition if out_partition is not None else tuple(P(*s.sharding) for s in out_specs),
+            tuple(self._partition(s) for s in in_specs),
+            out_partition if out_partition is not None else tuple(self._partition(s) for s in out_specs),
             [_abstract(s) for s in in_specs],
             name, aliases,
         )
@@ -232,7 +245,7 @@ class Exporter:
 
     def samplers(self, rows):
         a = self.adapter
-        from kimi.model import Spec
+        from .spec import Spec
 
         logits = a.logits_spec(rows)
         out = {}
@@ -293,6 +306,8 @@ class Exporter:
             "compile_options": {"num_replicas": 1, "num_partitions": cfg.tp, "use_spmd_partitioning": True},
             "functions": functions,
         }
+        if self.device_assignment is not None:
+            metadata["compile_options"]["device_assignment"] = self.device_assignment
         (self.out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         return metadata
 
