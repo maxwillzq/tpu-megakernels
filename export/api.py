@@ -23,6 +23,9 @@ class ExportConfig:
     # compile-time failures (kernel VMEM, for example) at export.
     compile_check: bool = False
     model_name: str = ""
+    # Draft tokens a step can verify (grammar-forced tokens, i.e. jump-forward decoding, or a
+    # drafter's): a model with recurrent state keeps one checkpoint slot per verify token.
+    max_verify_tokens: int = 0
 
     def __post_init__(self):
         self.token_buckets = tuple(sorted(set(int(b) for b in self.token_buckets)))
@@ -34,8 +37,10 @@ class ExportConfig:
                 size *= 2
             self.req_buckets = tuple(buckets + [self.max_num_seqs])
         self.req_buckets = tuple(sorted(set(int(r) for r in self.req_buckets)))
+        if self.max_verify_tokens < 0:
+            raise ValueError(f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}")
         if self.num_state_slots == self.num_blocks:
-            raise ValueError("num_blocks must differ from num_state_slots (max_num_seqs + 1)")
+            raise ValueError(f"num_blocks must differ from num_state_slots ({self.num_state_slots})")
 
     @property
     def pages_per_seq(self):
@@ -50,6 +55,12 @@ class ExportConfig:
         return self.max_num_seqs + 1
 
     @property
+    def recurrent_window(self):
+        """Recurrent slots a sequence holds: its state slot, then one checkpoint per verify token
+        (``mamba_ckpt_indices`` is ``[max_num_seqs, recurrent_window]``)."""
+        return self.max_verify_tokens + 1
+
+    @property
     def num_state_slots(self):
-        """One recurrent slot per sequence plus null slot 0."""
-        return self.max_num_seqs + 1
+        """``recurrent_window`` slots per sequence plus null slot 0."""
+        return self.max_num_seqs * self.recurrent_window + 1

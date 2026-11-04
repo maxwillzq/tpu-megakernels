@@ -12,6 +12,7 @@ lowered for, and must be lowered for the target TPU topology (``--topology``).
 """
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -53,10 +54,11 @@ def family_counts(layers):
     return layers - (layers // 4 + (layers == 93)), mla
 
 
-def cache_length(max_model_len):
-    """MLA cache positions per slot: room for a sequence tile past the last token, in the
-    kernel's 128-position cache tiles."""
-    return max(384, -(-(max_model_len + tiles.TILE) // 128) * 128)
+def cache_length(max_model_len, block_size=128):
+    """MLA cache positions the kernel takes per sequence: room for a sequence tile past the last
+    token, in whole 128-position kernel cache tiles and whole ``block_size`` pages."""
+    unit = math.lcm(128, block_size)
+    return max(384, -(-(max_model_len + tiles.TILE) // unit) * unit)
 
 
 class HeaderCheckpoint(load.Checkpoint):
@@ -123,6 +125,9 @@ class KimiAdapter:
             raise ValueError("the Kimi megakernel is TP32")
         if cfg.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be positive")
+        if cfg.max_verify_tokens >= tiles.TILE:
+            raise ValueError(f"max_verify_tokens must be below {tiles.TILE}: a verify window is one "
+                             "sequence tile of the kernel")
         self.checkpoint = checkpoint
         self.source = Path(checkpoint.path)
         self.cfg, self.layers = cfg, layers
@@ -132,7 +137,7 @@ class KimiAdapter:
         self.eos_token_id = self._checkpoint_eos()
         self.gate_up = gate_up
         self.weights = weight_layout(checkpoint, layers, gate_up)
-        self.context = cache_length(cfg.max_model_len)
+        self.context = cache_length(cfg.max_model_len, cfg.block_size)
 
     def _checkpoint_eos(self):
         for name in ("generation_config.json", "config.json"):
@@ -164,19 +169,23 @@ class KimiAdapter:
         return [Spec("rank", (TP,), "int32", (self.axis,))]
 
     def control_specs(self, bucket):
-        return control_specs(bucket, self.cfg.max_num_seqs, self.cfg.pages_per_seq)
+        cfg = self.cfg
+        return control_specs(bucket, cfg.max_num_seqs, cfg.pages_per_seq, cfg.recurrent_window,
+                             cfg.num_state_slots)
 
     def state_specs(self):
-        """KDA convolution history and recurrent state, and the MLA key/value caches, by slot.
+        """KDA convolution history and recurrent state in recurrent state slots, and the MLA
+        key/value caches in pages of ``block_size`` positions.
 
         Global head dims are 32 x the kernel's 3 heads per rank."""
         k, m = family_counts(self.layers)
         s, h, a = self.cfg.num_state_slots, HEADS * TP, self.axis
+        blocks, bs = self.cfg.num_blocks, self.cfg.block_size
         return [
             Spec("kda_conv", (s, k, 3, h, 3, 128), "bfloat16", (None, None, None, a, None, None)),
             Spec("kda_state", (s, k, h, 128, 128), "float32", (None, None, a, None, None)),
-            Spec("mla_key", (s, m, h, self.context, 256), "bfloat16", (None, None, a, None, None)),
-            Spec("mla_value", (s, m, h, self.context, 128), "bfloat16", (None, None, a, None, None)),
+            Spec("mla_key", (blocks, m, h, bs, 256), "bfloat16", (None, None, a, None, None)),
+            Spec("mla_value", (blocks, m, h, bs, 128), "bfloat16", (None, None, a, None, None)),
         ]
 
     def hidden_spec(self, rows):
@@ -202,7 +211,7 @@ class KimiAdapter:
 
     def forward_body(self, n_controls, n_constants, n_weights):
         names = [s.name for s in self.forward_param_specs()]
-        hidden_size = self.hidden
+        hidden_size, block_size, context = self.hidden, self.cfg.block_size, self.context
 
         def body(*args):
             controls = dict(zip(CONTROL_NAMES, args[:n_controls]))
@@ -211,7 +220,8 @@ class KimiAdapter:
             weights = {n: w[0] for n, w in zip(names, args[start: start + n_weights])}
             states = tuple(args[start + n_weights:])
             num_tokens = controls["input_ids"].shape[0]
-            states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, hidden_size)
+            states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, hidden_size,
+                                           block_size=block_size, context=context)
             return (*states, hidden)
 
         return body

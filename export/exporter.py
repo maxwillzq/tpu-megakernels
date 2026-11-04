@@ -39,6 +39,8 @@ CONTROL_CONTRACT_NAMES = {
     "query_start_loc": "query_start_loc",
     "req_dist": "req_dist",
     "state_slots": "mamba_state_indices",
+    "mamba_ckpt_indices": "mamba_ckpt_indices",
+    "mamba_slot_read_offsets": "mamba_slot_read_offsets",
 }
 
 
