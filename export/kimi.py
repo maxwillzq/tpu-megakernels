@@ -238,9 +238,13 @@ class KimiAdapter:
     def constant_values(self):
         return {"rank": np.arange(TP, dtype=np.int32)}
 
-    def write_checkpoint(self, out, specs, axis_sizes, log=print):
-        from .kimi_checkpoint import write_megakernel_checkpoint
+    def write_checkpoint(self, out, specs, axis_sizes, log=print, presharded=None):
+        from .kimi_checkpoint import write_from_presharded, write_megakernel_checkpoint
 
+        if presharded is not None:
+            write_from_presharded(presharded, self.checkpoint.config, self.layers, out, specs, axis_sizes,
+                                  self.constant_values(), log)
+            return
         if not self.checkpoint.has_weights:
             raise ValueError(f"{self.source} has headers only; export with --weights none")
         write_megakernel_checkpoint(self.checkpoint, self.layers, out, specs, axis_sizes,

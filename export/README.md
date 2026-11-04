@@ -21,7 +21,12 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
   model). A checkpoint directory holding only `config.json`,
   `model.safetensors.index.json`, the tokenizer and `headers.json` (every tensor's safetensors
   header entry) is enough for that.
-- **Bring-up.** `--layers N` exports the first N layers (2..93).
+- **Weight source.** `--presharded DIR` reads the weights from `kimi.load`'s pre-sharded TP32
+  layout (`rank??/dense.bin` and expert files) instead of the Hugging Face checkpoint. It is
+  faster, because the layout is already per rank. `--checkpoint-dir gs://...` writes
+  `serving_checkpoint` straight to GCS.
+- **Bring-up.** `--layers N` exports the first N layers (2..93). With `--presharded`, the stacked
+  families keep their first entries.
 - **Recipe.** `--recipe plain` (default) uses the public demo's plain kernel options. `tuned`
   uses its batch-8 tuning, minus the sequence-parallel epilogue.
 
@@ -103,12 +108,14 @@ JAX_PLATFORMS=cpu pytest tests/test_export_tiles_cpu.py tests/test_kimi_export_c
 - `test_kimi_export_cpu.py`: exports a 4-layer megakernel prefix for `tpu7x:2x2x4`. It checks the
   weight layout, the two kernel calls per forward, donation, shard-local types and the device
   assignment.
-- `test_kimi_checkpoint_cpu.py`: rank slabs of the converted checkpoint, and the lossless FP8
-  reblock.
+- `test_kimi_checkpoint_cpu.py`: rank slabs of the converted checkpoint, conversion of a
+  pre-sharded layer prefix, and the lossless FP8 reblock.
 - `test_kimi_tokenizer_cpu.py`: the converted tokenizer and the chat template.
 
-Checked against the published checkpoint's headers: the full 93-layer artifact exports in about
-30 s and passes vllm-torchtpu's validator.
+Checked against the published checkpoint's headers:
+- the full 93-layer artifact exports in about 30 s and passes vllm-torchtpu's validator;
+- its 37 weight families have exactly the shapes and dtypes of the megakernel's pre-sharded
+  weights (`gs://cloud-devkit/ckpt/presharded/kimi-k3-tp32`), gate/up after the FP8 reblock.
 
 ## Limitations and next steps
 

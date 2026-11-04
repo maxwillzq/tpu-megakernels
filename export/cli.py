@@ -32,6 +32,10 @@ def build_parser():
     p.add_argument("--target-tpu", default="7x")
     p.add_argument("--weights", choices=["checkpoint", "none"], default="checkpoint",
                    help="convert the checkpoint into serving_checkpoint, or write subgraphs only")
+    p.add_argument("--presharded", help="read the weights from kimi.load's pre-sharded TP32 layout "
+                   "(rank??/dense.bin, ...) instead of --checkpoint")
+    p.add_argument("--checkpoint-dir", help="write serving_checkpoint here (a directory or gs:// "
+                   "prefix) instead of under --output-dir")
     return p
 
 
@@ -51,7 +55,8 @@ def main(argv=None):
     ex = exporter.Exporter(adapter, cfg)
     ex.export()
     if args.weights == "checkpoint":
-        adapter.write_checkpoint(cfg.output_dir, ex.checkpoint_specs(), ex.axis_sizes)
+        adapter.write_checkpoint(args.checkpoint_dir or cfg.output_dir, ex.checkpoint_specs(), ex.axis_sizes,
+                                 presharded=args.presharded)
     print(f"wrote {cfg.output_dir}")
 
 

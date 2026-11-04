@@ -30,9 +30,15 @@ class CheckpointWriter:
 
     def __init__(self, artifact_dir, specs, axis_sizes):
         self.axis_sizes = dict(axis_sizes)
-        self.root = Path(artifact_dir) / "serving_checkpoint"
-        self.data = self.root / "data"
-        self.data.mkdir(parents=True, exist_ok=True)
+        artifact_dir = str(artifact_dir)
+        if artifact_dir.startswith("gs://"):
+            bucket, _, prefix = artifact_dir[len("gs://"):].partition("/")
+            self.gcs = (bucket, f"{prefix.rstrip('/')}/serving_checkpoint")
+            self.root = None
+        else:
+            self.gcs = None
+            self.root = Path(artifact_dir) / "serving_checkpoint"
+            (self.root / "data").mkdir(parents=True, exist_ok=True)
         self.specs = list(specs)
         self.index = {s.name: i for i, s in enumerate(self.specs)}
         self.arrays = {}
@@ -52,7 +58,7 @@ class CheckpointWriter:
             self.arrays[name] = ts.open(
                 {
                     "driver": "zarr",
-                    "kvstore": {"driver": "file", "path": str(self.data / f"array_{self.index[name]}")},
+                    "kvstore": self._kvstore(f"data/array_{self.index[name]}"),
                     "metadata": {
                         "shape": list(spec.shape),
                         "chunks": chunks,
@@ -67,6 +73,11 @@ class CheckpointWriter:
             ).result()
         return self.arrays[name]
 
+    def _kvstore(self, relative):
+        if self.gcs is not None:
+            return {"driver": "gcs", "bucket": self.gcs[0], "path": f"{self.gcs[1]}/{relative}"}
+        return {"driver": "file", "path": str(self.root / relative)}
+
     def write(self, name, value, region=None):
         """Write ``value`` into array ``name`` at ``region`` (a tuple of slices; default all)."""
         array = self._open(name)
@@ -78,7 +89,8 @@ class CheckpointWriter:
         missing = [s.name for s in self.specs if s.name not in self.arrays]
         if missing:
             raise ValueError(f"checkpoint arrays never written: {missing[:5]}")
-        (self.root / "metadata.json").write_text(json.dumps({"version": 1}) + "\n")
+        marker = ts.open({"driver": "json", "kvstore": self._kvstore("metadata.json")}, create=True).result()
+        marker.write({"version": 1}).result()
 
 
 def write_checkpoint(artifact_dir, specs, tensors, axis_sizes):
