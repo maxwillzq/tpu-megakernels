@@ -78,3 +78,23 @@ def test_forward_runs_the_megakernel_shard_local(artifact):
         # Shard-local: three heads per rank, the cache a sequence tile longer than max_model_len.
         assert f"tensor<{SEQS + 1}x1x3x{adapter.context}x256xbf16>" in signature
         assert adapter.context >= 512 + 8
+
+
+def test_forward_keeps_the_kernel_layout_for_slot_states(artifact):
+    """The slot arrays stay in the layout the megakernel takes: no state-sized relayout copies or
+    SparseCore data-format calls in the compiled forward (each one moves a multi-gigabyte cache
+    on every step of the full model)."""
+    from export import lowering
+
+    out, meta, adapter = artifact
+    devices = exporter.lowering_devices(adapter.cfg)
+    devices = adapter.device_assignment(devices)
+    text = (out / meta["functions"]["forward"]["8"]["file_path"]).read_text()
+    exe = lowering.compile_shard_local(text, devices, "forward_bucket8")
+    hlo = "\n".join(m.to_string() for m in exe.hlo_modules())
+    cache = rf"bf16\[{SEQS + 1},\d+,3,{adapter.context},(256|128)\]"
+    copies = [l for l in hlo.splitlines() if re.search(cache + r"\S* copy\(", l)]
+    assert not copies, copies[:3]
+    assert "sparse-core-data-format-call" not in hlo
+    layouts = set(re.findall(rf"bf16\[{SEQS + 1},\d+,3,{adapter.context},256\]\{{([0-9,]+)", hlo))
+    assert layouts == {"4,3,2,1,0"}, layouts
