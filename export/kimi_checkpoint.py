@@ -74,50 +74,86 @@ def _prefix_count(config, name, layers):
     return None if ids is None else len(ids)
 
 
-def write_from_presharded(path, config, layers, out, specs, axis_sizes, constants, log=print):
-    """Convert ``kimi.load``'s pre-sharded TP32 layout (93 layers) into ``specs`` for a
-    ``layers``-layer prefix (stacked families keep their first entries, as ``kimi.load`` orders
-    them by layer)."""
-    path = Path(path)
-    if json.loads((path / "layout.json").read_text())["layers"] != 93:
+class _Store:
+    """Byte-range reads from a local directory or a ``gs://`` prefix."""
+
+    def __init__(self, path):
+        path = str(path)
+        if path.startswith("gs://"):
+            import tensorstore as ts
+
+            bucket, _, prefix = path[len("gs://"):].partition("/")
+            self.kv = ts.KvStore.open({"driver": "gcs", "bucket": bucket, "path": prefix.rstrip("/") + "/"}).result()
+            self.root = None
+        else:
+            self.kv, self.root = None, Path(path)
+
+    def read(self, name, offset=0, size=None):
+        if self.kv is None:
+            with open(self.root / name, "rb", buffering=0) as handle:
+                handle.seek(offset)
+                return handle.read() if size is None else handle.read(size)
+        end = None if size is None else offset + size
+        result = self.kv.read(name, byte_range=slice(offset, end)).result()
+        if result.state != "value":
+            raise FileNotFoundError(name)
+        return result.value
+
+    def json(self, name):
+        return json.loads(self.read(name))
+
+
+def write_from_presharded(path, config, layers, out, specs, axis_sizes, constants, log=print, workers=2):
+    """Convert ``kimi.load``'s pre-sharded TP32 layout (93 layers; a directory or ``gs://``
+    prefix) into ``specs`` for a ``layers``-layer prefix: stacked families keep their first
+    entries (``kimi.load`` orders them by layer), and only those bytes are read."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = _Store(path)
+    if store.json("layout.json")["layers"] != 93:
         raise ValueError(f"{path}: expected the 93-layer pre-sharded layout")
     writer = CheckpointWriter(out, specs, axis_sizes)
     wanted = {s.name for s in specs}
     for name in constants:
         if name in wanted:
             writer.write(name, constants[name])
-    for rank in range(TP):
-        rank_dir = path / f"rank{rank:02d}"
-        index = json.loads((rank_dir / "index.json").read_text())["families"]
-        log(f"converting rank {rank}")
-        with open(rank_dir / "dense.bin", "rb", buffering=0) as handle:
-            for name, spec in sorted(index.items(), key=lambda item: item[1].get("offset", 0)):
-                if "file" not in spec or name not in wanted:
-                    continue
-                shape, dtype = spec["shape"], np.dtype(spec["dtype"])
-                count = _prefix_count(config, name, layers)
-                keep = shape if count is None else [count, *shape[1:]]
-                handle.seek(spec["offset"])
-                value = np.fromfile(handle, dtype=dtype, count=int(np.prod(keep))).reshape(keep)
-                writer.write(name, value[None], (slice(rank, rank + 1),))
-        families = {n: index[n] for n in EXPERT_FAMILIES}
-        readers = {n: _expert_layers(rank_dir, families[n]) for n in ("expert_gu", "expert_gus", "expert_down", "expert_ds")}
+    for name in wanted:
+        writer._open(name)  # create every array before the ranks write in parallel
+
+    def array(name, offset, shape, dtype):
+        dtype = np.dtype(dtype)
+        return np.frombuffer(store.read(name, offset, int(np.prod(shape)) * dtype.itemsize), dtype).reshape(shape)
+
+    def convert(rank):
+        rank_dir = f"rank{rank:02d}"
+        index = store.json(f"{rank_dir}/index.json")["families"]
+        for name, spec in index.items():
+            if "file" not in spec or name not in wanted:
+                continue
+            count = _prefix_count(config, name, layers)
+            shape = spec["shape"] if count is None else [count, *spec["shape"][1:]]
+            value = array(f"{rank_dir}/{spec['file']}", spec["offset"], shape, spec["dtype"])
+            writer.write(name, value[None], (slice(rank, rank + 1),))
         for i in range(layers - 1):
-            layer = {n: next(r) for n, r in readers.items()}
+            layer = {n: _expert_layer(store, rank_dir, index[n], i, array) for n in EXPERT_FAMILIES}
             encoded, coarse = _reblock(layer["expert_gu"], layer["expert_gus"])
             region = (slice(rank, rank + 1), slice(i, i + 1))
             writer.write("expert_gu", encoded[None, None], region)
             writer.write("expert_gus", coarse[None, None], region)
             writer.write("expert_down", layer["expert_down"][None, None], region)
             writer.write("expert_ds", layer["expert_ds"][None, None], region)
+        log(f"converted rank {rank}")
+
+    with ThreadPoolExecutor(workers) as pool:
+        list(pool.map(convert, range(TP)))
     writer.finish()
 
 
-def _expert_layers(rank_dir, spec):
-    """One expert family of a rank, layer by layer, from its files."""
-    layer_shape, dtype = spec["shape"][1:], np.dtype(spec["dtype"])
-    count = int(np.prod(layer_shape))
+def _expert_layer(store, rank_dir, spec, layer, array):
+    """Layer ``layer`` of one expert family of a rank, from the file holding it."""
+    shape = spec["shape"][1:]
+    size = int(np.prod(shape)) * np.dtype(spec["dtype"]).itemsize
     for filename, (lo, hi) in zip(spec["files"], spec["layer_ranges"]):
-        with open(rank_dir / filename, "rb", buffering=0) as handle:
-            for _ in range(lo, hi):
-                yield np.fromfile(handle, dtype=dtype, count=count).reshape(layer_shape)
+        if lo <= layer < hi:
+            return array(f"{rank_dir}/{filename}", (layer - lo) * size, shape, spec["dtype"])
+    raise ValueError(f"{rank_dir}: no file holds layer {layer}")

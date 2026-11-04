@@ -36,6 +36,10 @@ def build_parser():
                    "(rank??/dense.bin, ...) instead of --checkpoint")
     p.add_argument("--checkpoint-dir", help="write serving_checkpoint here (a directory or gs:// "
                    "prefix) instead of under --output-dir")
+    p.add_argument("--checkpoint-only", action="store_true",
+                   help="write only serving_checkpoint (no lowering, no libtpu): e.g. on a CPU host, for "
+                        "an artifact whose subgraphs were exported with --weights none")
+    p.add_argument("--workers", type=int, default=2, help="ranks converted in parallel")
     return p
 
 
@@ -52,11 +56,16 @@ def main(argv=None):
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, recipe=args.recipe, model_name=args.checkpoint)
-    ex = exporter.Exporter(adapter, cfg)
-    ex.export()
+    if args.checkpoint_only:
+        # abstract_params order: constants, then weights (export.exporter.Exporter.slots).
+        specs, axis_sizes = adapter.constant_specs() + adapter.param_specs(), {adapter.axis: TP, "data": 1}
+    else:
+        ex = exporter.Exporter(adapter, cfg)
+        ex.export()
+        specs, axis_sizes = ex.checkpoint_specs(), ex.axis_sizes
     if args.weights == "checkpoint":
-        adapter.write_checkpoint(args.checkpoint_dir or cfg.output_dir, ex.checkpoint_specs(), ex.axis_sizes,
-                                 presharded=args.presharded)
+        adapter.write_checkpoint(args.checkpoint_dir or cfg.output_dir, specs, axis_sizes,
+                                 presharded=args.presharded, workers=args.workers)
     print(f"wrote {cfg.output_dir}")
 
 
