@@ -3,16 +3,19 @@
 The Kimi megakernel processes one tile of ``TILE`` rows per call, in one of two forms:
 
 - **decode tile** (``sequence_rows=1``): up to ``TILE`` sequences, one token each;
-- **sequence tile** (``sequence_rows=TILE``): ``TILE`` consecutive tokens of one sequence (the
-  speculative-verification form, used here for prefill chunks and verify windows).
+- **sequence tile** (``sequence_rows=s``, ``s`` dividing ``TILE``): ``TILE / s`` sequences of
+  ``s`` consecutive tokens each (the speculative-verification form, used here for prefill chunks
+  and verify windows).
 
 Its states are dense per tile row: KDA states ``[rows, ...]`` and MLA caches ``[sequences, ...,
 context, d]``. rvllm instead keeps the KDA states in recurrent state slots and the MLA caches in
 pages, and sends a ragged batch: request ``r`` owns tokens ``query_start_loc[r] :
 query_start_loc[r + 1]``; its pages are row ``r`` of ``block_tables``.
 
-:func:`forward` bridges the two inside the exported graph: requests with one token go through
-decode tiles, longer ones through sequence tiles, ``TILE`` tokens at a time. Each call gathers
+:func:`forward` bridges the two inside the exported graph. Each request goes to the tile form
+of the smallest ``sequence_rows`` holding its tokens: one token to decode tiles, up to ``s``
+tokens to sequence tiles packing ``TILE / s`` such requests (several short verify windows in one
+call), and longer requests through ``TILE``-row sequence tiles, ``TILE`` tokens at a time. Each call gathers
 its rows' state slots and pages, runs the kernel, and writes back what the call changed: the KDA
 states, and only the cache positions it wrote.
 
@@ -49,14 +52,22 @@ import numpy as np
 TILE = 8
 
 
-def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, context, tile=TILE):
+def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, context, tile=TILE,
+            sequence_rows=None):
     """``(states, hidden [num_tokens, hidden_size])`` for one rvllm step.
+
+    ``sequence_rows`` (default ``(1, tile)``) are the tile forms used, each a kernel call in the
+    graph: 1 and ``tile`` always, and any divisors of ``tile`` between them.
 
     ``kernel(states, tokens, positions, sequence_rows) -> (hidden [tile, H], states)`` runs one
     tile on dense states. ``states`` is ``(kda_conv, kda_state, mla_key, mla_value)``: the KDA
     states lead with recurrent slots, the MLA caches are pages ``[num_blocks, layers, heads,
     block_size, d]``; the kernel takes them as ``[rows, layers, heads, context, d]``.
     """
+    sequence_rows = sorted(set(sequence_rows or ()) | {1, tile})
+    if any(tile % s for s in sequence_rows):
+        raise ValueError(f"sequence_rows {sequence_rows} must divide the tile {tile}")
+    packed = sequence_rows[1:-1]
     conv, rec, key, value = states
     ids, positions = controls["input_ids"], controls["positions"]
     qsl, slots = controls["query_start_loc"], controls["state_slots"]
@@ -167,8 +178,61 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
     carry = (conv, rec, key, value, hidden)
     carry = jax.lax.fori_loop(0, -(-num_single // tile), decode_tile, carry)
 
-    # Sequence tiles: requests with more than one token, TILE tokens per call, in order.
-    chunks = jnp.where(q_len > 1, -(-q_len // tile), 0)
+    # Packed sequence tiles: requests with lo < q_len <= s, tile // s of them per call.
+    def packed_tiles(carry, lo, s):
+        n = tile // s
+        mine = (q_len > lo) & (q_len <= s)
+        count_mine = jnp.sum(mine.astype(jnp.int32))
+        padded_mine = -(-seqs // n) * n
+        mine_order = jnp.argsort(jnp.where(mine, 0, 1), stable=True).astype(jnp.int32)
+        mine_order = jnp.concatenate([mine_order, jnp.zeros((padded_mine - seqs,), jnp.int32)])
+        offset = rows % s  # row -> token of its sequence
+        slot = rows // s  # row -> sequence of the tile
+
+        def packed_tile(t, carry):
+            conv, rec, key, value, hidden = carry
+            request = jax.lax.dynamic_slice(mine_order, (t * n,), (n,))
+            valid = t * n + jnp.arange(n) < count_mine
+            start = jnp.where(valid, qsl[request], 0)
+            count = jnp.where(valid, q_len[request], 0)
+            first = jnp.where(valid, positions[start], 0)
+            row_request, row_valid = request[slot], valid[slot]
+            row_count = count[slot]
+            token_index = start[slot] + offset
+            live = row_valid & (offset < row_count)
+            tokens = jnp.where(live, ids[jnp.clip(token_index, 0, num_tokens - 1)], 0)
+            pos = first[slot] + offset
+            source = jnp.stack([jnp.where(valid[j], resume_slot(request[j]), 0) for j in range(n)])
+            # Each sequence's chained recurrence reads its first row's input state.
+            rows_of = lambda st: jnp.repeat(fresh(take(st, source), first == 0), s, axis=0)  # noqa: E731
+            page_lists = [page_ids(request[j], valid[j]) for j in range(n)]
+            h, (cs, rs, k, v) = kernel(
+                (rows_of(conv), rows_of(rec), gather_cache(key, page_lists), gather_cache(value, page_lists)),
+                tokens, pos, s,
+            )
+            own = ckpt[row_request]  # [tile, window]
+            verify = row_request < num_decode
+            keep = row_valid & jnp.where(verify, (offset < row_count) & (offset < window), offset == row_count - 1)
+            pick = jnp.where(verify, jnp.minimum(offset, window - 1), 0)
+            target = jnp.where(keep, jnp.take_along_axis(own, pick[:, None], axis=1)[:, 0], 0)
+            conv = put(conv, target, cs)
+            rec = put(rec, target, rs)
+            for j in range(n):
+                for i in range(s):
+                    key = put_position(key, k, j, page_lists[j], first[j] + i)
+                    value = put_position(value, v, j, page_lists[j], first[j] + i)
+            hidden = hidden.at[jnp.where(live, token_index, num_tokens)].set(h.astype(hidden.dtype), mode="drop")
+            return conv, rec, key, value, hidden
+
+        return jax.lax.fori_loop(0, -(-count_mine // n), packed_tile, carry)
+
+    lo = 1
+    for s in packed:
+        carry = packed_tiles(carry, lo, s)
+        lo = s
+
+    # Sequence tiles: requests with more than `lo` tokens, TILE tokens per call, in order.
+    chunks = jnp.where(q_len > lo, -(-q_len // tile), 0)
     chunk_end = jnp.cumsum(chunks)
     chunk_start = chunk_end - chunks
 

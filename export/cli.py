@@ -38,6 +38,10 @@ def build_parser():
                    help="draft tokens a step can verify (grammar-forced tokens: jump-forward decoding); "
                         "each takes a recurrent checkpoint slot per sequence. 0 turns jump-forward "
                         "decoding off; at most 7 (one 8-row sequence tile)")
+    p.add_argument("--sequence-rows", type=_ints, default=(),
+                   help="packed sequence-tile forms, e.g. 2,4: verify windows of up to 2 (4) tokens "
+                        "share one kernel call, 4 (2) per call; each form is one more kernel call in "
+                        "the forward graph")
     p.add_argument("--weights", choices=["checkpoint", "none"], default="checkpoint",
                    help="convert the checkpoint into serving_checkpoint, or write subgraphs only")
     p.add_argument("--presharded", help="read the weights from kimi.load's pre-sharded TP32 layout "
@@ -65,7 +69,7 @@ def main(argv=None):
         max_model_len=args.max_model_len, block_size=args.block_size, num_blocks=args.num_blocks,
         token_buckets=args.token_buckets, req_buckets=args.req_buckets, target_tpu=args.target_tpu,
         topology=args.topology, compile_check=args.compile_check,
-        max_verify_tokens=args.max_verify_tokens,
+        max_verify_tokens=args.max_verify_tokens, sequence_rows=args.sequence_rows,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,

@@ -49,12 +49,12 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _export(path, verify, draft=False):
+def _export(path, verify, draft=False, sequence_rows=()):
     from export import api, checkpoint, exporter
     from toy_tiles_adapter import TP, ToyAdapter
 
     cfg = api.ExportConfig(str(path), TP, max_num_seqs=4, max_model_len=64, block_size=16, num_blocks=40,
-                           token_buckets=(8, 32), max_verify_tokens=verify)
+                           token_buckets=(8, 32), max_verify_tokens=verify, sequence_rows=sequence_rows)
     adapter = ToyAdapter(cfg, draft=draft)
     ex = exporter.Exporter(adapter, cfg)
     ex.export(log=lambda *_: None)
@@ -116,7 +116,8 @@ def test_rvllm_serves_the_toy_artifact_like_the_reference(tmp_path):
         pytest.skip(f"needs {TP} devices (XLA_FLAGS=--xla_force_host_platform_device_count)")
     jump_adapter, tensors = _export(tmp_path / "jump", verify=3)
     _export(tmp_path / "plain", verify=0)
-    _export(tmp_path / "draft", verify=3, draft=True)
+    # The drafter's 4-token verify windows share kernel calls, 2 per call.
+    _export(tmp_path / "draft", verify=3, draft=True, sequence_rows=(2, 4))
     texts, free_steps = {}, {}
     for name in ("jump", "plain", "draft"):
         with _serve(tmp_path / name) as port:

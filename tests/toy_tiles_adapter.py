@@ -168,11 +168,20 @@ class ToyAdapter:
                     c, r, k, v, h = step(c, r, k, v, *inp)
                     return (c, r, k, v), (c, r, h)
 
-                (_, _, k, v), (cs, rs, h) = jax.lax.scan(body, (conv[0], rec[0], key[0], value[0]), (emb, positions))
-                return h, (cs[:, None], rs[:, None], k[None, None], v[None, None])
+                def sequence(c, r, k, v, e, p):
+                    (_, _, k, v), (cs, rs, h) = jax.lax.scan(body, (c, r, k, v), (e, p))
+                    return h, cs, rs, k, v
+
+                n = tokens.shape[0] // sequence_rows
+                split = lambda x: x.reshape(n, sequence_rows, *x.shape[1:])  # noqa: E731
+                h, cs, rs, k, v = jax.vmap(sequence)(split(conv)[:, 0], split(rec)[:, 0], key, value, split(emb),
+                                                     split(positions))
+                merge = lambda x: x.reshape(n * sequence_rows, *x.shape[2:])  # noqa: E731
+                return merge(h), (merge(cs)[:, None], merge(rs)[:, None], k[:, None], v[:, None])
 
             states, hidden = tiles.forward(kernel, tuple(states), controls, controls["input_ids"].shape[0], H,
-                                           block_size=block_size, context=context)
+                                           block_size=block_size, context=context,
+                                           sequence_rows=self.cfg.sequence_rows)
             if self.drafter:
                 return (*states, hidden, controls["input_ids"][:, None].astype(jnp.bfloat16))
             return (*states, hidden)

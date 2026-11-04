@@ -245,7 +245,8 @@ class KimiAdapter:
             num_tokens = controls["input_ids"].shape[0]
             width = hidden_size + (self.drafter.c.context_width if self.drafter else 0)
             states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, width,
-                                           block_size=block_size, context=context)
+                                           block_size=block_size, context=context,
+                                           sequence_rows=self.cfg.sequence_rows)
             if self.drafter:
                 return (*states, hidden[:, :hidden_size], hidden[:, hidden_size:])
             return (*states, hidden)

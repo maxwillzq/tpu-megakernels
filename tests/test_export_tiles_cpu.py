@@ -2,8 +2,8 @@
 kernel.
 
 A stand-in kernel with the Kimi megakernel's state contract (decode tiles: independent rows;
-sequence tiles: one sequence's consecutive tokens chained from row 0's state, every row's
-post-state returned, all rows written to the cache) must give, through ``tiles.forward``, the
+sequence tiles of ``s`` rows per sequence: each sequence's consecutive tokens chained from its
+first row's state, every row's post-state returned, all rows written to its cache) must give, through ``tiles.forward``, the
 hidden states and the states that running each sequence token by token gives. An engine drives
 it as rvllm does: pages from a pool, ``W`` recurrent slots per sequence, decodes first, verify
 windows whose accepted drafts set the next step's read offset, and slot and page reuse.
@@ -46,8 +46,16 @@ def kernel(states, tokens, positions, sequence_rows):
         c, r, k, v, h = step(c, r, k, v, *inp)
         return (c, r, k, v), (c, r, h)
 
-    (_, _, k, v), (cs, rs, h) = jax.lax.scan(body, (conv[0], rec[0], key[0], value[0]), (tokens, positions))
-    return h, (cs, rs, k[None], v[None])
+    def sequence(c, r, k, v, tokens, positions):
+        (_, _, k, v), (cs, rs, h) = jax.lax.scan(body, (c, r, k, v), (tokens, positions))
+        return h, cs, rs, k, v
+
+    n = tokens.shape[0] // sequence_rows
+    split = lambda x: x.reshape(n, sequence_rows, *x.shape[1:])  # noqa: E731
+    h, cs, rs, k, v = jax.vmap(sequence)(split(conv)[:, 0], split(rec)[:, 0], key, value, split(tokens),
+                                         split(positions))
+    merge = lambda x: x.reshape(n * sequence_rows, *x.shape[2:])  # noqa: E731
+    return merge(h), (merge(cs), merge(rs), k, v)
 
 
 def zero_state():
@@ -162,9 +170,9 @@ def run_plan(fwd, window, plan, check_states):
             engine.finish(name)
 
 
-def make_forward(tile):
+def make_forward(tile, sequence_rows=None):
     return jax.jit(lambda states, controls: tiles.forward(
-        kernel, states, controls, TOKENS, H, block_size=BS, context=CTX, tile=tile))
+        kernel, states, controls, TOKENS, H, block_size=BS, context=CTX, tile=tile, sequence_rows=sequence_rows))
 
 
 # Prefill chunks (one longer than a page and than a tile), single decodes, chunked prefill
@@ -194,10 +202,12 @@ def test_tiles_match_token_by_token_reference_without_checkpoints(tile):
     run_plan(make_forward(tile), 1, PREFILL_PLAN, True)
 
 
-@pytest.mark.parametrize("tile", [8, 4])
-def test_verify_windows_keep_a_checkpoint_per_token(tile):
-    run_plan(make_forward(tile), W, VERIFY_PLAN, True)
+@pytest.mark.parametrize("tile,sequence_rows", [(8, None), (4, None), (8, (2, 4)), (8, (4,)), (4, (2,))])
+def test_verify_windows_keep_a_checkpoint_per_token(tile, sequence_rows):
+    # With packed forms, the 2- and 3-token windows (and 2-token prefills) share calls.
+    run_plan(make_forward(tile, sequence_rows), W, VERIFY_PLAN, True)
 
 
-def test_prefill_steps_with_checkpoints():
-    run_plan(make_forward(8), W, PREFILL_PLAN, True)
+@pytest.mark.parametrize("sequence_rows", [None, (2, 4)])
+def test_prefill_steps_with_checkpoints(sequence_rows):
+    run_plan(make_forward(8, sequence_rows), W, PREFILL_PLAN, True)

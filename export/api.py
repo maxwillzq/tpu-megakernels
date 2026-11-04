@@ -26,6 +26,10 @@ class ExportConfig:
     # Draft tokens a step can verify (grammar-forced tokens, i.e. jump-forward decoding, or a
     # drafter's): a model with recurrent state keeps one checkpoint slot per verify token.
     max_verify_tokens: int = 0
+    # Packed sequence-tile forms (divisors of the kernel tile between 1 and it): requests of up
+    # to s tokens (short verify windows) share a kernel call, tile // s per call. Each form is one
+    # more kernel call in the forward graph.
+    sequence_rows: tuple[int, ...] = ()
 
     def __post_init__(self):
         self.token_buckets = tuple(sorted(set(int(b) for b in self.token_buckets)))
