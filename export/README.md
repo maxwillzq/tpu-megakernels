@@ -39,6 +39,13 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
 - **Kernel options.** The demo's batch-8 tuning (its default `tuned` recipe), minus the
   sequence-parallel epilogue. The demo's `plain` options exceed the kernel's 64 MiB VMEM at the
   8-row tile on tpu7x.
+- **Jump-forward decoding.** `--max-verify-tokens K` (default 7, at most 7) keeps `K + 1`
+  recurrent checkpoint slots per sequence, so rvllm can verify up to `K` draft tokens per step:
+  grammar-forced tokens of structured outputs (jump-forward, "GaaD") and, later, speculative
+  drafts. `0` exports a forward without checkpoints, where rvllm decodes structured outputs one
+  token per step.
+- **Context capacity.** `--num-blocks` pages of `--block-size` (128) positions hold every
+  sequence's MLA keys and values, shared by all sequences.
 - **Compile check.** `--compile-check` also compiles every forward bucket for the topology
   (ahead of time, no TPU needed), so compile-time failures such as kernel VMEM overflows show at
   export.
@@ -61,30 +68,44 @@ The megakernel processes one tile of eight rows per call, in one of two forms:
   speculative-verification form, and the megakernel's own server prefills with it.
 
 rvllm sends a ragged batch instead: request `r` owns tokens `query_start_loc[r] :
-query_start_loc[r+1]`, and its states live in slot `mamba_state_indices[r]`. `export/tiles.py`
-bridges the two inside the forward graph:
+query_start_loc[r+1]`, its KDA states live in recurrent state slots and its MLA keys and values
+in the pages of `block_tables` row `r`. `export/tiles.py` bridges the two inside the forward
+graph:
 - requests with one token go through decode tiles;
-- longer requests (prefill, chunked prefill) go through sequence tiles, eight tokens at a time,
-  in order;
-- each call gathers its rows' slots, runs the kernel, and scatters back what changed (the KDA
-  states, and only the cache positions the call wrote);
+- longer requests (prefill chunks, verify windows) go through sequence tiles, eight tokens at a
+  time, in order;
+- each call copies its rows' state slots and pages into the kernel's dense layout, runs the
+  kernel, and writes back what changed (the KDA states, and only the cache positions the call
+  wrote);
 - a sequence starting at position 0 starts from zero KDA states, because rvllm reuses slots.
+
+**Recurrent checkpoints.** Request `r` holds slots `mamba_ckpt_indices[r]`: its state slot and
+`K` checkpoint slots. It resumes from `ckpt[r, mamba_slot_read_offsets[ckpt[r, 0]]]`, the state
+after the last token rvllm accepted. A verify window (a decode with `1 + k` tokens) writes the
+state after its `j`-th token to `ckpt[r, j]`; any other request writes its final state to
+`ckpt[r, 0]`. The KDA recurrence cannot be rolled back, so this is what lets rvllm verify drafts
+and keep only the accepted ones. The MLA cache needs nothing extra: rejected positions lie past
+the sequence's length and are overwritten before they are read.
 
 Each `forward_bucket{B}` therefore contains two megakernel calls (`tpu_custom_call`), each in a
 loop whose trip count depends on the batch.
 
-States, all addressed by slot (rvllm treats a state as recurrent when its leading dimension is
-`num_state_slots = max_num_seqs + 1`; slot 0 is the null slot):
+States (rvllm treats a state as recurrent when its leading dimension is `num_state_slots =
+max_num_seqs * (K + 1) + 1`, and as paged KV when it is `num_blocks`; slot and page 0 are null):
 
-| State | Global shape | Kernel layout per rank |
+| State | Global shape | Contents |
 | :--- | :--- | :--- |
-| `kda_conv` | `[slots, 69, 3, 96, 3, 128]` bf16 | q/k/v short-conv history, 3 heads |
+| `kda_conv` | `[slots, 69, 3, 96, 3, 128]` bf16 | q/k/v short-conv history |
 | `kda_state` | `[slots, 69, 96, 128, 128]` f32 | KDA recurrent state |
-| `mla_key` | `[slots, 24, 96, C, 256]` bf16 | per-head MLA keys |
-| `mla_value` | `[slots, 24, 96, C, 128]` bf16 | per-head MLA values |
+| `mla_key` | `[num_blocks, 24, 96, block_size, 256]` bf16 | per-head MLA keys |
+| `mla_value` | `[num_blocks, 24, 96, block_size, 128]` bf16 | per-head MLA values |
 
-`C` is `max_model_len + 8` rounded up to 128: a sequence tile may write up to seven positions past
-a sequence's last token. Those entries are never read before a later step overwrites them.
+A page `[24, 96, block_size, d]` is already in the order of the kernel's cache `[rows, 24, 96, C,
+d]`, so pages are copied whole along leading dimensions. Index gathers or scatters on inner
+dimensions would make XLA lay the multi-gigabyte pools out otherwise than the kernel takes them,
+and relayout them on every step. The kernel's cache length `C` is `max_model_len + 8` rounded up
+to the block size: a sequence tile may write up to seven positions past a sequence's last token,
+and those entries are never read before a later step overwrites them.
 
 Weights are `kimi.load`'s selected per-rank layout (TP4 x EP8 experts, gate/up in FP8 with BF16
 block scales), stored as `[32, *local]` arrays split over ranks. Rank `r`'s slab is exactly what
@@ -106,7 +127,7 @@ The megakernel moves data between devices with remote DMAs addressed by mesh pos
 | `spec.py` | tensor specs, the forward's control inputs |
 | `lowering.py` | lowers `jit(shard_map(body))` under the GSPMD partitioner and keeps its per-device `@shmap_body` as `@main` |
 | `exporter.py` | assembles the subgraphs and `metadata.json`, and checks each `@main` against the declared shard-local shapes |
-| `tiles.py` | ragged, slot-addressed batch -> megakernel tiles |
+| `tiles.py` | ragged batch with state slots, checkpoints and pages -> megakernel tiles |
 | `kimi.py` | Kimi adapter: weight and state specs, the forward and logits bodies, companion files |
 | `kimi_checkpoint.py` | Hugging Face checkpoint -> the megakernel's per-rank weights |
 | `sampling.py` | JAX ports of vllm-torchtpu's samplers |
@@ -122,14 +143,17 @@ JAX_PLATFORMS=cpu pytest tests/test_export_tiles_cpu.py tests/test_kimi_export_c
 ```
 
 - `test_export_tiles_cpu.py`: `tiles.forward` with a stand-in kernel that has the megakernel's
-  state contract, against token-by-token execution. It covers mixed decode and prefill steps,
-  chunks that do not fill a tile, and slot reuse.
+  state contract, against token-by-token execution, driven as rvllm drives it. It covers mixed
+  decode and prefill steps, chunks that do not fill a tile, verify windows with all, none or some
+  drafts accepted, preempted sequences prefilling again, and slot and page reuse.
 - `test_export_tiles_rvllm_cpu.py`: rvllm serves a toy artifact with the same structure on CPU.
-  Concurrent greedy requests must give the reference's tokens. Run it in the rvllm-dev image with
-  `RVLLM_BIN` and `PJRT_CPU_LIB_PATH` set.
+  Concurrent greedy requests must give the reference's tokens; JSON-schema outputs must be valid
+  and identical with and without checkpoints, in fewer steps with them (jump-forward decoding).
+  Run it in the rvllm-dev image with `RVLLM_BIN` and `PJRT_CPU_LIB_PATH` set.
 - `test_kimi_export_cpu.py`: exports a 4-layer megakernel prefix for `tpu7x:2x2x4`. It checks the
-  weight layout, the two kernel calls per forward, donation, shard-local types and the device
-  assignment.
+  weight layout, the two kernel calls per forward, donation, shard-local types, the device
+  assignment, and that the compiled forward keeps the page pools in the kernel's layout (no
+  copies).
 - `test_kimi_checkpoint_cpu.py`: rank slabs of the converted checkpoint, conversion of a
   pre-sharded layer prefix, and the lossless FP8 reblock.
 - `test_kimi_tokenizer_cpu.py`: the converted tokenizer and the chat template.
@@ -141,11 +165,10 @@ Checked against the published checkpoint's headers:
 
 ## Limitations and next steps
 
-- **Gathered states.** Each call gathers its rows' MLA caches (`[rows, 24, 3, C, 384]` per
-  rank) out of the slot arrays, because the kernel reads caches by tile row. Next: give the
-  kernel's cache DMAs a row-to-slot table, which removes the gather.
+- **Gathered caches.** Each call copies its rows' pages into a dense cache (`[rows, 24, 3, C,
+  384]` per rank), because the kernel reads caches by tile row. Next: give the kernel's cache
+  DMAs a page table, which removes the copy.
 - **Prefill.** Prefill runs eight tokens per call, as in the megakernel's own server, so long
   prompts are slow. A batched prefill kernel would be a separate subgraph.
-- **Not exported:** DSpark speculative decoding, and the `tuned` recipe's sequence-parallel
-  epilogue.
-- **Not yet validated on TPU:** numerics and performance need a `tpu7x:2x2x4` slice.
+- **Not exported:** DSpark speculative decoding (the checkpoints already let rvllm verify
+  drafts), and the `tuned` recipe's sequence-parallel epilogue.
