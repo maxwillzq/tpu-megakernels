@@ -159,13 +159,13 @@ class Exporter:
     def _partition(self, spec):
         return P(*(self.mesh_axis if a == self.adapter.axis else a for a in spec.sharding))
 
-    def _lower(self, fn, in_specs, out_specs, name, aliases=None, out_partition=None):
+    def _lower(self, fn, in_specs, out_specs, name, aliases=None, out_partition=None, compile_check=False):
         text = lowering.lower(
             fn, self.mesh,
             tuple(self._partition(s) for s in in_specs),
             out_partition if out_partition is not None else tuple(self._partition(s) for s in out_specs),
             [_abstract(s) for s in in_specs],
-            name, aliases,
+            name, aliases, compile_check=compile_check,
         )
         _check_signature(text, name, in_specs, out_specs, self.axis_sizes)
         return text
@@ -202,6 +202,7 @@ class Exporter:
             a.forward_body(len(controls), len(constants), len(weights)),
             in_specs, states + [hidden], name,
             {first_state + i: i for i in range(len(states))},
+            compile_check=cfg.compile_check,
         )
         inputs = [
             _entry(s, i, i, "user_io", name=CONTROL_CONTRACT_NAMES[s.name]) for i, s in enumerate(controls)

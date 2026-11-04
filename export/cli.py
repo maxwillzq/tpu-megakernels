@@ -25,8 +25,12 @@ def build_parser():
     p.add_argument("--num-blocks", type=int, required=True)
     p.add_argument("--token-buckets", type=_ints, default=(8, 16, 32, 64, 128))
     p.add_argument("--req-buckets", type=_ints, default=())
-    p.add_argument("--recipe", choices=["plain", "tuned"], default="plain",
-                   help="megakernel options: the demo's plain path, or its batch-8 tuning")
+    p.add_argument("--recipe", choices=["plain", "tuned"], default="tuned",
+                   help="megakernel options: the demo's batch-8 tuning (default; the demo's default too), "
+                        "or its plain path, which exceeds the kernel's VMEM at the 8-row tile")
+    p.add_argument("--compile-check", action="store_true",
+                   help="also compile each forward bucket for --topology (ahead of time, no TPU needed) "
+                        "to catch compile-time failures such as kernel VMEM overflows")
     p.add_argument("--gate-up", choices=["fp8", "mxfp4"], default="fp8",
                    help="routed gate/up storage: FP8 with BF16 block scales (no in-kernel MXFP4 unpack, "
                         "twice the bytes) or the checkpoint's packed MXFP4 (half the HBM and artifact size)")
@@ -55,7 +59,7 @@ def main(argv=None):
         output_dir=args.output_dir, tp=TP, max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len, block_size=args.block_size, num_blocks=args.num_blocks,
         token_buckets=args.token_buckets, req_buckets=args.req_buckets, target_tpu=args.target_tpu,
-        topology=args.topology,
+        topology=args.topology, compile_check=args.compile_check,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, recipe=args.recipe, gate_up=args.gate_up,

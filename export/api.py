@@ -19,6 +19,9 @@ class ExportConfig:
     # Lower against this TPU topology (e.g. "tpu7x:4x4x2") instead of the local devices; needs
     # libtpu, not TPU hardware.
     topology: str | None = None
+    # Also compile each forward bucket for the target devices (ahead of time), to catch
+    # compile-time failures (kernel VMEM, for example) at export.
+    compile_check: bool = False
     model_name: str = ""
     extra: dict = field(default_factory=dict)
 

@@ -36,8 +36,12 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
   78 GB per device, 2.5 TB in total). `--gate-up mxfp4` keeps the checkpoint's packed MXFP4
   (about 51 GB per device, 1.65 TB), which leaves more HBM for slots and context. Which one is
   faster is a TPU measurement.
-- **Recipe.** `--recipe plain` (default) uses the public demo's plain kernel options. `tuned`
-  uses its batch-8 tuning, minus the sequence-parallel epilogue.
+- **Recipe.** `--recipe tuned` (default, as in the demo) uses the demo's batch-8 kernel tuning,
+  minus the sequence-parallel epilogue. `plain` exceeds the kernel's 64 MiB VMEM at the 8-row
+  tile.
+- **Compile check.** `--compile-check` also compiles every forward bucket for the topology
+  (ahead of time, no TPU needed), so compile-time failures such as kernel VMEM overflows show at
+  export.
 
 For example, the subgraphs on any host and the weights on a large CPU host:
 

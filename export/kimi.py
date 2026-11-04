@@ -33,8 +33,10 @@ GATE_UP_FORMATS = ("fp8", "mxfp4")
 
 
 def kernel_options(recipe, sequence_rows):
-    """``decode_local`` options for a recipe. ``tuned`` is the demo's batch-8 tuning without its
-    sequence-parallel epilogue, which leaves the final hidden states split over ranks."""
+    """``decode_local`` options for a recipe. ``tuned`` (the default, as in the demo) is the demo's
+    batch-8 tuning without its sequence-parallel epilogue, which leaves the final hidden states
+    split over ranks. ``plain`` exceeds the kernel's 64 MiB VMEM at the 8-row tile (decode by
+    5.8 MiB, sequence tiles by 1.6 MiB, on tpu7x)."""
     options = {"gate_first_kda_projection": True, "kernel_options": frozenset(KERNEL_DEFAULTS)}
     if recipe == "plain":
         return options
@@ -122,7 +124,7 @@ class KimiAdapter:
     axis = "model"  # metadata axis (rvllm's)
     mesh_axis = "tp"  # the megakernel's shard_map axis
 
-    def __init__(self, checkpoint, cfg, *, layers=93, recipe="plain", gate_up="fp8", model_name="kimi-k3",
+    def __init__(self, checkpoint, cfg, *, layers=93, recipe="tuned", gate_up="fp8", model_name="kimi-k3",
                  kernel=None):
         if cfg.tp != TP:
             raise ValueError("the Kimi megakernel is TP32")
