@@ -101,19 +101,39 @@ def check_module(text, name):
 def lower(fn, mesh, in_specs, out_specs, abstract_args, name, aliases=None, compile_check=False):
     """Lower ``fn`` (a shard-local body) over ``mesh`` to an artifact module named ``name``.
 
-    With ``compile_check`` the program is also compiled for ``mesh``'s devices (ahead of time:
-    for a TPU topology no TPU is needed), so that compile-time failures such as exceeding a
-    kernel's VMEM surface at export rather than at serve time."""
+    With ``compile_check`` the shard-local module is also compiled for ``mesh``'s devices (see
+    :func:`compile_shard_local`)."""
     body = jax.shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
     with gspmd():
-        lowered = jax.jit(body, keep_unused=True).lower(*abstract_args)
-        if compile_check:
-            try:
-                lowered.compile()
-            except Exception as e:  # noqa: BLE001  (XLA raises a generic runtime error)
-                raise RuntimeError(f"{name} does not compile for {mesh.devices.flat[0].device_kind}: {e}") from e
-        text = lowered.as_text()
-    return shard_local_module(text, name, aliases)
+        text = jax.jit(body, keep_unused=True).lower(*abstract_args).as_text()
+    module = shard_local_module(text, name, aliases)
+    if compile_check:
+        compile_shard_local(module, list(mesh.devices.flat), name)
+    return module
+
+
+def compile_shard_local(text, devices, name="module"):
+    """Compile an artifact module as the runtime does: the shard-local module itself, with
+    ``num_partitions = len(devices)`` and that device assignment. Ahead of time for a TPU
+    topology, so compile-time failures (a kernel exceeding VMEM, for example) show at export.
+
+    Compiling the global ``jit(shard_map(...))`` program instead runs XLA's SPMD partitioner over
+    the manual region, which the runtime never does (and which crashes on the full Kimi stack)."""
+    import numpy as np
+    from jax._src import compiler
+    from jax._src.interpreters import mlir
+    from jax._src.lib import xla_client as xc
+
+    options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=len(devices), device_assignment=np.array([[d.id for d in devices]]))
+    options.executable_build_options.use_spmd_partitioning = True
+    with mlir.make_ir_context():
+        module = mlir.ir.Module.parse(text)
+        try:
+            devices[0].client.compile(module, executable_devices=xc.DeviceList(tuple(devices)),
+                                      compile_options=options)
+        except Exception as e:  # noqa: BLE001  (XLA raises a generic runtime error)
+            raise RuntimeError(f"{name} does not compile for {devices[0].device_kind}: {e}") from e
 
 
 def main_signature(text):
