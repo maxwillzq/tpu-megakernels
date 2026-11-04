@@ -1,0 +1,24 @@
+{#- Kimi K3 chat, as openai_server.render_chat_tokens renders it: system/user turns in message
+    segments, earlier assistant turns in a response channel, and a generation prompt that opens
+    the response channel (or the think channel with `thinking=true`, adding the default
+    thinking-effort system message when there is no system message). -#}
+{%- set ns = namespace(has_system=false) -%}
+{%- for m in messages -%}{%- if m.role == 'system' -%}{%- set ns.has_system = true -%}{%- endif -%}{%- endfor -%}
+{%- set think = thinking is defined and thinking -%}
+{%- if think and not ns.has_system -%}
+<|open|>message role="system" type="thinking-effort"<|sep|>`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.
+Now the system is invoked with `thinking_effort=max`.<|close|>message<|sep|><|end_of_msg|>
+{%- endif -%}
+{%- for m in messages -%}
+{%- if m.content is string -%}{%- set content = m.content -%}
+{%- elif m.content -%}{%- set content = m.content | selectattr('type', 'equalto', 'text') | map(attribute='text') | join('') -%}
+{%- else -%}{%- set content = '' -%}{%- endif -%}
+{%- if m.role == 'assistant' -%}
+<|open|>message role="assistant"<|sep|><|open|>response<|sep|>{{ content }}<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>
+{%- else -%}
+<|open|>message role="{{ 'system' if m.role == 'developer' else m.role }}"<|sep|>{{ content }}<|close|>message<|sep|><|end_of_msg|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt is not defined or add_generation_prompt -%}
+<|open|>message role="assistant"<|sep|><|open|>{{ 'think' if think else 'response' }}<|sep|>
+{%- endif -%}

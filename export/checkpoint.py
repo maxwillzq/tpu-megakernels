@@ -1,0 +1,110 @@
+"""Write an artifact's ``serving_checkpoint`` (RFC 0003): one zarr v2 array per weight slot.
+
+Array ``i`` is the global value of ``abstract_params`` input ``i``. Arrays are created up front
+and filled by regions, so a large model is written slice by slice (per layer, per rank) without
+ever holding a global tensor in memory.
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+import tensorstore as ts
+
+# numpy/ml_dtypes name -> zarr v2 dtype string rvllm accepts.
+_ZARR_DTYPES = {
+    "bfloat16": "bfloat16",
+    "float32": "<f4",
+    "float16": "<f2",
+    "int32": "<i4",
+    "int64": "<i8",
+    "uint32": "<u4",
+    "uint8": "|u1",
+    "int8": "|i1",
+    "float8_e4m3fn": "float8_e4m3fn",
+}
+
+
+_ITEMSIZE = {"bfloat16": 2, "float32": 4, "float16": 2, "int32": 4, "int64": 8, "uint32": 4, "uint8": 1,
+             "int8": 1, "float8_e4m3fn": 1}
+# A per-rank slab larger than this is chunked per layer (one large expert layer is ~600 MB).
+CHUNK_BYTES = 256 << 20
+
+
+class CheckpointWriter:
+    """Creates ``<artifact>/serving_checkpoint/data/array_{i}`` and writes regions into them."""
+
+    def __init__(self, artifact_dir, specs, axis_sizes):
+        self.axis_sizes = dict(axis_sizes)
+        artifact_dir = str(artifact_dir)
+        if artifact_dir.startswith("gs://"):
+            bucket, _, prefix = artifact_dir[len("gs://"):].partition("/")
+            self.gcs = (bucket, f"{prefix.rstrip('/')}/serving_checkpoint")
+            self.root = None
+        else:
+            self.gcs = None
+            self.root = Path(artifact_dir) / "serving_checkpoint"
+            (self.root / "data").mkdir(parents=True, exist_ok=True)
+        self.specs = list(specs)
+        self.index = {s.name: i for i, s in enumerate(self.specs)}
+        self.arrays = {}
+
+    def _open(self, name):
+        if name not in self.arrays:
+            spec = self.specs[self.index[name]]
+            chunks = [max(1, d) for d in spec.shape]
+            # Chunk sharded dims at the shard size so each region write is whole chunks.
+            for d, axis in enumerate(spec.sharding):
+                if axis is not None:
+                    chunks[d] = spec.shape[d] // self.axis_sizes[axis]
+            if spec.sharding[0] is not None and spec.shape[0] == self.axis_sizes[spec.sharding[0]]:
+                # Per-rank arrays [ranks, ...]: one chunk per rank, split by its leading (layer)
+                # dim only when a rank's slab is large, so small families stay a few objects.
+                if len(spec.shape) >= 3 and np.prod(chunks) * _ITEMSIZE[spec.dtype] > CHUNK_BYTES:
+                    chunks[1] = 1
+            elif len(spec.shape) >= 3:
+                chunks[0] = 1  # stacked layer families: one layer per chunk
+            self.arrays[name] = ts.open(
+                {
+                    "driver": "zarr",
+                    "kvstore": self._kvstore(f"data/array_{self.index[name]}"),
+                    "metadata": {
+                        "shape": list(spec.shape),
+                        "chunks": chunks,
+                        "dtype": _ZARR_DTYPES[spec.dtype],
+                        "compressor": None,
+                        "order": "C",
+                        "fill_value": None,
+                    },
+                    "create": True,
+                    "delete_existing": True,
+                }
+            ).result()
+        return self.arrays[name]
+
+    def _kvstore(self, relative):
+        if self.gcs is not None:
+            return {"driver": "gcs", "bucket": self.gcs[0], "path": f"{self.gcs[1]}/{relative}"}
+        return {"driver": "file", "path": str(self.root / relative)}
+
+    def write(self, name, value, region=None):
+        """Write ``value`` into array ``name`` at ``region`` (a tuple of slices; default all)."""
+        array = self._open(name)
+        target = array if region is None else array[region]
+        target.write(np.asarray(value)).result()
+
+    def finish(self):
+        """Mark the checkpoint's format version; every array must have been created."""
+        missing = [s.name for s in self.specs if s.name not in self.arrays]
+        if missing:
+            raise ValueError(f"checkpoint arrays never written: {missing[:5]}")
+        marker = ts.open({"driver": "json", "kvstore": self._kvstore("metadata.json")}, create=True).result()
+        marker.write({"version": 1}).result()
+
+
+def write_checkpoint(artifact_dir, specs, tensors, axis_sizes):
+    """Write every spec from ``tensors`` (name -> global array) in one go (small models)."""
+    writer = CheckpointWriter(artifact_dir, specs, axis_sizes)
+    for spec in specs:
+        writer.write(spec.name, tensors[spec.name])
+    writer.finish()

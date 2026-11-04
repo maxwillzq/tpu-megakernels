@@ -5182,6 +5182,8 @@ def decode_local(
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    rank=None,
+    return_hidden: bool = False,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5195,6 +5197,12 @@ def decode_local(
     sequences respectively, every row's KDA post-state is returned, and MLA
     caches receive all rows. ``aux_hidden_layers`` additionally returns the
     residual stream entering those layers as ``[len, batch, hidden]``.
+
+    ``rank`` (int32 scalar) is this device's TP index; without it the index is
+    ``axis_index("tp")``, which lowers to ``partition_id`` (exporters pass it
+    as data instead). With ``return_hidden`` the result leads with the final
+    normalized hidden states ``[batch, hidden]`` instead of the logits, for
+    callers that apply the LM head separately.
     """
     if gate_first_kda_projection is False:
         raise ValueError("The clean decoder always uses the split KDA gate projection")
@@ -5210,7 +5218,8 @@ def decode_local(
     aux_hidden_layers = tuple(aux_hidden_layers)
 
     # Compose true-batched layer primitives without the batch-one fused stack.
-    rank = jax.lax.axis_index("tp")
+    if rank is None:
+        rank = jax.lax.axis_index("tp")
     vocabulary = weights["embedding"].shape[0]
 
     if batched_decoder_boundaries:
@@ -5293,7 +5302,23 @@ def decode_local(
         )
     )
 
-    if sequence_parallel_pre_attention and batched_decoder_boundaries:
+    if return_hidden:
+        if sequence_parallel_pre_attention:
+            raise ValueError("return_hidden needs the replicated decoder epilogue")
+        active_block_count = (layers - 1) // 12 + 1
+
+        def finish_hidden(_, inputs):
+            prefix_row, block_rows = inputs
+            hidden_row = kimi.attention_residual(
+                prefix_row,
+                block_rows[:active_block_count],
+                weights["output_res"][0],
+                eps,
+            )[None]
+            return (), kimi.rms(hidden_row, weights["final_norm"], eps)[0]
+
+        _, logits = jax.lax.scan(finish_hidden, (), (prefix, blocks))
+    elif sequence_parallel_pre_attention and batched_decoder_boundaries:
         logits = jnp.dot(
             prefix, weights["lm_head"], preferred_element_type=jnp.float32
         )
@@ -5333,6 +5358,8 @@ def decode_local(
         key_caches,
         value_caches,
     )
+    if return_hidden:
+        return (logits, aux_hidden, new_states) if aux_hidden_layers else (logits, new_states)
     if aux_hidden_layers:
         return logits[None], aux_hidden, new_states
     return logits[None], new_states
