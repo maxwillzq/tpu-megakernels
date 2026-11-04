@@ -86,9 +86,23 @@ class DSparkDrafter:
         return {PREFIX + n: np.ascontiguousarray(v) for n, v in dspark._shard_weights(self.c, weights, self.tp).items()}
 
     def tensors(self):
+        """``(draft.name, [tp, *local])`` pairs from the checkpoint, one tensor at a time (the full
+        draft model is about 10 GB)."""
+        from pathlib import Path
+
+        import ml_dtypes
+        from safetensors import safe_open
+
         from kimi import dspark
 
-        return self.shard(dspark.load_checkpoint_weights(self.directory, self.c))
+        with safe_open(str(Path(self.directory) / "model.safetensors"), "np") as f:
+            for name, shape in dspark.weight_shapes(self.c).items():
+                value = f.get_tensor(name)
+                if tuple(value.shape) != shape:
+                    raise ValueError(f"{name}: expected {shape}, found {value.shape}")
+                if value.dtype == np.uint16:  # bf16 bit patterns
+                    value = value.view(ml_dtypes.bfloat16)
+                yield from self.shard({name: value.astype(ml_dtypes.bfloat16)}).items()
 
     # The shard-local body.
     def body(self, n_controls, n_constants, n_weights):

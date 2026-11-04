@@ -284,7 +284,7 @@ class KimiAdapter:
             raise ValueError("the drafter's arrays must follow the model's")
         if draft_names:
             writer = CheckpointWriter(out, specs, axis_sizes)
-            for name, value in self.drafter.tensors().items():
+            for name, value in self.drafter.tensors():
                 log(f"writing {name}")
                 writer.write(name, value)
         if draft_only:
