@@ -25,9 +25,6 @@ def build_parser():
     p.add_argument("--num-blocks", type=int, required=True)
     p.add_argument("--token-buckets", type=_ints, default=(8, 16, 32, 64, 128))
     p.add_argument("--req-buckets", type=_ints, default=())
-    p.add_argument("--recipe", choices=["plain", "tuned"], default="tuned",
-                   help="megakernel options: the demo's batch-8 tuning (default; the demo's default too), "
-                        "or its plain path, which exceeds the kernel's VMEM at the 8-row tile")
     p.add_argument("--compile-check", action="store_true",
                    help="also compile each forward bucket for --topology (ahead of time, no TPU needed) "
                         "to catch compile-time failures such as kernel VMEM overflows")
@@ -62,7 +59,7 @@ def main(argv=None):
         topology=args.topology, compile_check=args.compile_check,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
-    adapter = KimiAdapter(source, cfg, layers=args.layers, recipe=args.recipe, gate_up=args.gate_up,
+    adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,
                           model_name=args.checkpoint)
     if args.checkpoint_only:
         # abstract_params order: constants, then weights (export.exporter.Exporter.slots).

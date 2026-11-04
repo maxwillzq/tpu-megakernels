@@ -1,6 +1,6 @@
 """Export configuration shared by the exporter and the model adapters."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -23,7 +23,6 @@ class ExportConfig:
     # compile-time failures (kernel VMEM, for example) at export.
     compile_check: bool = False
     model_name: str = ""
-    extra: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.token_buckets = tuple(sorted(set(int(b) for b in self.token_buckets)))

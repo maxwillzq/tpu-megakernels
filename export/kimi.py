@@ -26,24 +26,18 @@ HEADS = 3  # attention heads per rank (96 / 32)
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 # The public demo's kernel options (demo_kimi_dspark.decode_options).
 KERNEL_DEFAULTS = ("mla_cache_write_in_attend", "mla_pv_mxu_hilo")
-RECIPES = ("plain", "tuned")
 # Routed gate/up storage: FP8 with BF16 block scales (the loader's reblock: no in-kernel MXFP4
 # unpack, twice the bytes), or the checkpoint's packed MXFP4 (half the HBM and artifact size).
 GATE_UP_FORMATS = ("fp8", "mxfp4")
 
 
-def kernel_options(recipe, sequence_rows):
-    """``decode_local`` options for a recipe. ``tuned`` (the default, as in the demo) is the demo's
-    batch-8 tuning without its sequence-parallel epilogue, which leaves the final hidden states
-    split over ranks. ``plain`` exceeds the kernel's 64 MiB VMEM at the 8-row tile (decode by
-    5.8 MiB, sequence tiles by 1.6 MiB, on tpu7x)."""
-    options = {"gate_first_kda_projection": True, "kernel_options": frozenset(KERNEL_DEFAULTS)}
-    if recipe == "plain":
-        return options
-    if recipe != "tuned":
-        raise ValueError(f"recipe must be one of {RECIPES}")
+def kernel_options(sequence_rows):
+    """``decode_local`` options: the demo's batch-8 tuning (its default ``tuned`` recipe) without
+    its sequence-parallel epilogue, which leaves the final hidden states split over ranks. The
+    demo's ``plain`` options exceed the kernel's 64 MiB VMEM at the 8-row tile on tpu7x."""
     return {
-        **options,
+        "gate_first_kda_projection": True,
+        "kernel_options": frozenset(KERNEL_DEFAULTS),
         "residual_reduction_order": "relaxed",
         "mla_cache_batch_tile_size": 4 if sequence_rows == 1 else None,
         "alias_expert_scales": True,
@@ -124,15 +118,14 @@ class KimiAdapter:
     axis = "model"  # metadata axis (rvllm's)
     mesh_axis = "tp"  # the megakernel's shard_map axis
 
-    def __init__(self, checkpoint, cfg, *, layers=93, recipe="tuned", gate_up="fp8", model_name="kimi-k3",
-                 kernel=None):
+    def __init__(self, checkpoint, cfg, *, layers=93, gate_up="fp8", model_name="kimi-k3"):
         if cfg.tp != TP:
             raise ValueError("the Kimi megakernel is TP32")
         if cfg.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be positive")
         self.checkpoint = checkpoint
         self.source = Path(checkpoint.path)
-        self.cfg, self.layers, self.recipe = cfg, layers, recipe
+        self.cfg, self.layers = cfg, layers
         self.model_name = model_name
         self.vocab_size = checkpoint.config.vocab
         self.hidden = checkpoint.config.dim
@@ -140,7 +133,6 @@ class KimiAdapter:
         self.gate_up = gate_up
         self.weights = weight_layout(checkpoint, layers, gate_up)
         self.context = cache_length(cfg.max_model_len)
-        self._kernel = kernel
 
     def _checkpoint_eos(self):
         for name in ("generation_config.json", "config.json"):
@@ -196,12 +188,10 @@ class KimiAdapter:
     # Shard-local bodies.
     def kernel(self, weights, rank):
         """``tiles.forward``'s kernel: one megakernel call on this rank's weights."""
-        if self._kernel is not None:
-            return self._kernel(weights, rank)
         from kimi import decode_megakernel
 
         def call(states, tokens, positions, sequence_rows):
-            options = {k: v for k, v in kernel_options(self.recipe, sequence_rows).items() if v is not None}
+            options = {k: v for k, v in kernel_options(sequence_rows).items() if v is not None}
             hidden, new_states = decode_megakernel.decode_local(
                 weights, states, tokens, positions, batch_size=tiles.TILE, layers=self.layers,
                 sequence_rows=sequence_rows, rank=rank, return_hidden=True, **options,

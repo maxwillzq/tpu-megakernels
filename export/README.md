@@ -36,9 +36,9 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
   78 GB per device, 2.5 TB in total). `--gate-up mxfp4` keeps the checkpoint's packed MXFP4
   (about 51 GB per device, 1.65 TB), which leaves more HBM for slots and context. Which one is
   faster is a TPU measurement.
-- **Recipe.** `--recipe tuned` (default, as in the demo) uses the demo's batch-8 kernel tuning,
-  minus the sequence-parallel epilogue. `plain` exceeds the kernel's 64 MiB VMEM at the 8-row
-  tile.
+- **Kernel options.** The demo's batch-8 tuning (its default `tuned` recipe), minus the
+  sequence-parallel epilogue. The demo's `plain` options exceed the kernel's 64 MiB VMEM at the
+  8-row tile on tpu7x.
 - **Compile check.** `--compile-check` also compiles every forward bucket for the topology
   (ahead of time, no TPU needed), so compile-time failures such as kernel VMEM overflows show at
   export.
@@ -118,7 +118,7 @@ The megakernel moves data between devices with remote DMAs addressed by mesh pos
 
 ```bash
 JAX_PLATFORMS=cpu pytest tests/test_export_tiles_cpu.py tests/test_kimi_export_cpu.py \
-  tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py tests/test_export_topology_cpu.py
+  tests/test_kimi_checkpoint_cpu.py tests/test_kimi_tokenizer_cpu.py
 ```
 
 - `test_export_tiles_cpu.py`: `tiles.forward` with a stand-in kernel that has the megakernel's
