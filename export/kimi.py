@@ -215,12 +215,12 @@ class KimiAdapter:
 
         aux_layers = tuple(self.drafter.c.aux_layers) if self.drafter else ()
 
-        def call(states, tokens, positions, sequence_rows):
+        def call(states, tokens, positions, sequence_rows, page_tables=None):
             options = {k: v for k, v in kernel_options(sequence_rows).items() if v is not None}
             out = decode_megakernel.decode_local(
                 weights, states, tokens, positions, batch_size=tiles.TILE, layers=self.layers,
                 sequence_rows=sequence_rows, rank=rank, return_hidden=True, aux_hidden_layers=aux_layers,
-                **options,
+                page_tables=page_tables, **options,
             )
             if not aux_layers:
                 return out
@@ -246,7 +246,8 @@ class KimiAdapter:
             width = hidden_size + (self.drafter.c.context_width if self.drafter else 0)
             states, hidden = tiles.forward(self.kernel(weights, rank), states, controls, num_tokens, width,
                                            block_size=block_size, context=context,
-                                           sequence_rows=self.cfg.sequence_rows)
+                                           sequence_rows=self.cfg.sequence_rows,
+                                           paged_kernel=self.cfg.paged_kernel)
             if self.drafter:
                 return (*states, hidden[:, :hidden_size], hidden[:, hidden_size:])
             return (*states, hidden)

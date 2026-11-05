@@ -2482,6 +2482,21 @@ class MultiHeadLatentAttentionWorkspace:
     accumulator_vmem: Any  # [batch_size, 3, 128]
 
 
+class _CopyGroup:
+    """Several async copies started and waited on together."""
+
+    def __init__(self, copies):
+        self.copies = copies
+
+    def start(self):
+        for copy in self.copies:
+            copy.start()
+
+    def wait(self):
+        for copy in self.copies:
+            copy.wait()
+
+
 def mla(
     position_ref: TensorLike,  # [batch_size]
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
@@ -2503,15 +2518,24 @@ def mla(
     cache_batch_tile_size: int | None = None,
     sequence_rows: int = 1,
     probability_value_mxu: Literal["bf16", "hilo"] | None = None,
+    page_ref: TensorLike | None = None,  # [sequence_count * pages_per_sequence] (SMEM)
+    pages_per_sequence: int = 0,
 ) -> None:
     """Execute one multi-head latent-attention layer inside a Pallas program.
 
     Consecutive groups of ``sequence_rows`` rows belong to one sequence and
     share one cache entry. Within a group, rows represent consecutive tokens
     and attend causally to earlier rows from the same invocation.
+
+    With ``page_ref`` the caches are paged: ``key_cache_ref`` is a pool of
+    128-position pages ``[pages, 3, 128, 256]`` (likewise the values), and
+    sequence ``s``'s positions ``128 b .. 128 b + 127`` live in page
+    ``page_ref[s * pages_per_sequence + b]``. The kernel reads and writes the
+    cache 128 positions at a time, so a page is exactly one of its cache blocks.
     """
     batch_size, hidden_size = hidden_ref.shape
-    context_length = key_cache_ref.shape[2]
+    paged = page_ref is not None
+    context_length = pages_per_sequence * 128 if paged else key_cache_ref.shape[2]
     if not 1 <= batch_size <= 8:
         raise ValueError("MLA supports one to eight batch rows")
     if output_ref.shape != hidden_ref.shape:
@@ -2532,9 +2556,14 @@ def mla(
     first_tile_rows = cache_batch_tile_size if sequence_rows == 1 else sequence_rows
     if position_ref.shape != (batch_size,):
         raise ValueError("Positions must match the MLA batch size")
-    if key_cache_ref.shape != (sequence_count, 3, context_length, 256):
+    if paged:
+        if key_cache_ref.shape[1:] != (3, 128, 256) or value_cache_ref.shape[1:] != (3, 128, 128):
+            raise ValueError("Paged caches must have shape [pages, 3, 128, 256 / 128]")
+        if page_ref.shape != (sequence_count * pages_per_sequence,):
+            raise ValueError("The page table must hold pages_per_sequence entries per sequence")
+    elif key_cache_ref.shape != (sequence_count, 3, context_length, 256):
         raise ValueError("Key cache must have shape [sequences, 3, context, 256]")
-    if value_cache_ref.shape != (sequence_count, 3, context_length, 128):
+    elif value_cache_ref.shape != (sequence_count, 3, context_length, 128):
         raise ValueError("Value cache must have shape [sequences, 3, context, 128]")
     if (
         weights.query_down_projection.shape != (hidden_size, 1536)
@@ -2595,29 +2624,43 @@ def mla(
 
     positions = jnp.stack(tuple(position_ref[index] for index in range(batch_size)))
 
-    def make_key_cache_copy(block, batch_offset):
-        return tpu.make_async_copy(
-            key_cache_ref.at[
-                pl.ds(batch_offset, cache_tile_rows),
-                :,
-                pl.ds(block * 128, 128),
-                :,
-            ],
-            workspace.key_cache_vmem.at[block % 2],
-            workspace.cache_copy_semaphores.at[0, block % 2],
+    def cache_block(ref, sequence, block):
+        """``[3, 128, d]``: positions ``128 block ..`` of ``sequence``'s cache."""
+        if paged:
+            return ref.at[page_ref[sequence * pages_per_sequence + block]]
+        return ref.at[sequence, :, pl.ds(block * 128, 128), :]
+
+    def make_cache_copy(cache_ref, cache_vmem, semaphore_index, block, batch_offset):
+        semaphore = workspace.cache_copy_semaphores.at[semaphore_index, block % 2]
+        if not paged:
+            return tpu.make_async_copy(
+                cache_ref.at[
+                    pl.ds(batch_offset, cache_tile_rows),
+                    :,
+                    pl.ds(block * 128, 128),
+                    :,
+                ],
+                cache_vmem.at[block % 2],
+                semaphore,
+            )
+        # Each row's block is its own page: one copy per row, sharing the slot's
+        # semaphore (each wait consumes its own copy's bytes).
+        return _CopyGroup(
+            tuple(
+                tpu.make_async_copy(
+                    cache_block(cache_ref, batch_offset + row, block),
+                    cache_vmem.at[block % 2, row],
+                    semaphore,
+                )
+                for row in range(cache_tile_rows)
+            )
         )
 
+    def make_key_cache_copy(block, batch_offset):
+        return make_cache_copy(key_cache_ref, workspace.key_cache_vmem, 0, block, batch_offset)
+
     def make_value_cache_copy(block, batch_offset):
-        return tpu.make_async_copy(
-            value_cache_ref.at[
-                pl.ds(batch_offset, cache_tile_rows),
-                :,
-                pl.ds(block * 128, 128),
-                :,
-            ],
-            workspace.value_cache_vmem.at[block % 2],
-            workspace.cache_copy_semaphores.at[1, block % 2],
-        )
+        return make_cache_copy(value_cache_ref, workspace.value_cache_vmem, 1, block, batch_offset)
 
     def prime_cache(batch_offset, maximum_block):
         for block in range(2):
@@ -2905,19 +2948,14 @@ def mla(
             if updated_key_cache_ref is not None:
                 @pl.when((block >= first_block) & (block <= last_block))
                 def write_back():
-                    block_slice = pl.ds(block * 128, 128)
                     key_write = tpu.make_async_copy(
                         key_tile,
-                        updated_key_cache_ref.at[
-                            sequence, :, block_slice, :
-                        ],
+                        cache_block(updated_key_cache_ref, sequence, block),
                         workspace.cache_copy_semaphores.at[0, slot],
                     )
                     value_write = tpu.make_async_copy(
                         value_tile,
-                        updated_value_cache_ref.at[
-                            sequence, :, block_slice, :
-                        ],
+                        cache_block(updated_value_cache_ref, sequence, block),
                         workspace.cache_copy_semaphores.at[1, slot],
                     )
                     key_write.start()
@@ -3639,8 +3677,13 @@ def stack(
     include_layer_zero: bool = False,
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    page_tables=None,
 ):
     """Fuse the decoder layers while keeping a native batch tile in VMEM.
+
+    ``page_tables`` (int32 ``[sequences, pages_per_sequence]``) makes the MLA
+    caches paged: ``states[2:]`` are pools ``[pages, layers, 3, 128, d]`` and a
+    sequence's positions ``128 b ..`` live in page ``page_tables[s, b]``.
 
     Layers 1..L-1 by default; with ``include_layer_zero`` the loop starts at
     layer 0 (``prefix`` is then the embedding; its KDA runs on the common
@@ -3738,7 +3781,20 @@ def stack(
         alias_expert_scales=alias_expert_scales,
         token_scatter_output=moe_token_scatter_output,
     )
-    def body(position_ref, state_row_ref, prefix_ref, embedding_ref, *refs):
+    paged = page_tables is not None
+    if paged:
+        sequences_per_tile = batch_size // sequence_rows
+        if page_tables.ndim != 2 or page_tables.shape[0] != sequences_per_tile:
+            raise ValueError("page_tables must be [sequences, pages_per_sequence]")
+        if states[2].shape[2:] != (3, 128, 256) or states[3].shape[2:] != (3, 128, 128):
+            raise ValueError("Paged MLA caches must be pools [pages, layers, 3, 128, d]")
+        pages_per_sequence = page_tables.shape[1]
+        page_scalar = jnp.asarray(page_tables, jnp.int32).reshape(-1)
+    else:
+        pages_per_sequence = 0
+        page_scalar = jnp.zeros((1,), jnp.int32)
+
+    def body(position_ref, state_row_ref, page_ref, prefix_ref, embedding_ref, *refs):
         layer_weights = dict(zip(NAMES, refs[: len(NAMES)], strict=True))
         output_residual_ref, final_normalization_ref = refs[
             len(NAMES) : len(NAMES) + len(EPILOGUE)
@@ -4330,12 +4386,12 @@ def stack(
                         communication_workspace=communication_workspace,
                         updated_key_cache_ref=(
                             key_output_ref.at[:, state_index]
-                            if mla_cache_write_in_attend
+                            if mla_cache_write_in_attend and not paged
                             else None
                         ),
                         updated_value_cache_ref=(
                             value_output_ref.at[:, state_index]
-                            if mla_cache_write_in_attend
+                            if mla_cache_write_in_attend and not paged
                             else None
                         ),
                         epsilon=eps,
@@ -4345,6 +4401,8 @@ def stack(
                         cache_batch_tile_size=mla_cache_batch_tile_size,
                         sequence_rows=sequence_rows,
                         probability_value_mxu=mla_probability_value_mxu,
+                        page_ref=page_ref if paged else None,
+                        pages_per_sequence=pages_per_sequence,
                     )
 
                     def commit_cache(
@@ -4576,23 +4634,38 @@ def stack(
                             def commit_cache_tile(tile_index):
                                 commit_cache_tile_body(tile_index)
 
+                    def hand_out_new_entries(semaphores):
+                        # Paged caches are read-only here: the layer's new keys and
+                        # values leave as outputs and the caller writes them to its pages.
+                        copies = (
+                            tpu.make_async_copy(new_key_vmem, key_output_ref.at[state_index], semaphores.at[0]),
+                            tpu.make_async_copy(new_value_vmem, value_output_ref.at[state_index], semaphores.at[1]),
+                        )
+                        for copy in copies:
+                            copy.start()
+                        for copy in copies:
+                            copy.wait()
+
                     commit_tile_rows = (
                         mla_cache_batch_tile_size if sequence_rows == 1 else 1
                     )
-                    pl.run_scoped(
-                        commit_cache,
-                        tpu.VMEM(
-                            (commit_tile_rows, 3, 128, 256),
-                            jnp.bfloat16,
-                        ),
-                        tpu.VMEM(
-                            (commit_tile_rows, 3, 128, 128),
-                            jnp.bfloat16,
-                        ),
-                        tpu.SemaphoreType.DMA(
-                            (2, commit_tile_rows)
-                        ),
-                    )
+                    if paged:
+                        pl.run_scoped(hand_out_new_entries, tpu.SemaphoreType.DMA((2,)))
+                    else:
+                        pl.run_scoped(
+                            commit_cache,
+                            tpu.VMEM(
+                                (commit_tile_rows, 3, 128, 256),
+                                jnp.bfloat16,
+                            ),
+                            tpu.VMEM(
+                                (commit_tile_rows, 3, 128, 128),
+                                jnp.bfloat16,
+                            ),
+                            tpu.SemaphoreType.DMA(
+                                (2, commit_tile_rows)
+                            ),
+                        )
 
                 pl.run_scoped(
                     compute,
@@ -5056,7 +5129,21 @@ def stack(
                 (batch_size, 8, hidden_size), jnp.bfloat16
             )
         ),
-        *(shape(state) for state in states),
+        *(shape(state) for state in states[:2]),
+        *(
+            # Paged: each latent-attention layer's new keys and values (the caches
+            # are read-only inputs; the caller writes these entries to its pages).
+            (
+                jax.ShapeDtypeStruct(
+                    (states[2].shape[1], batch_size, cache_handoff_head_count, 256), jnp.bfloat16
+                ),
+                jax.ShapeDtypeStruct(
+                    (states[3].shape[1], batch_size, cache_handoff_head_count, 128), jnp.bfloat16
+                ),
+            )
+            if paged
+            else tuple(shape(state) for state in states[2:])
+        ),
         jax.ShapeDtypeStruct(
             (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
         ),
@@ -5129,14 +5216,14 @@ def stack(
         *communication_scratch(batch_size)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
     )
-    state_offset = 4 + len(NAMES) + len(EPILOGUE) + len(dense_names)
+    state_offset = 5 + len(NAMES) + len(EPILOGUE) + len(dense_names)
     return pl.pallas_call(
         body,
         name="kimi_decoder_stack",
         out_shape=output_shapes,
-        input_output_aliases={state_offset + index: index + 2 for index in range(4)},
+        input_output_aliases={state_offset + index: index + 2 for index in range(2 if paged else 4)},
         grid_spec=tpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             in_specs=[
                 pl.BlockSpec(memory_space=tpu.VMEM if index < 2 else tpu.HBM)
                 for index in range(len(args))
@@ -5154,7 +5241,7 @@ def stack(
             disable_bounds_checks=True,
             shape_invariant_numerics=True,
         ),
-    )(positions, state_row_scalar, *args)
+    )(positions, state_row_scalar, page_scalar, *args)
 
 
 
@@ -5184,6 +5271,7 @@ def decode_local(
     kernel_options: frozenset = frozenset(),
     rank=None,
     return_hidden: bool = False,
+    page_tables=None,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5203,6 +5291,14 @@ def decode_local(
     as data instead). With ``return_hidden`` the result leads with the final
     normalized hidden states ``[batch, hidden]`` instead of the logits, for
     callers that apply the LM head separately.
+
+    ``page_tables`` (int32 ``[sequences, pages_per_sequence]``, sequences being
+    ``batch_size // sequence_rows``) makes the MLA caches paged: ``states[2:]``
+    are pools of 128-position pages ``[pages, layers, 3, 128, d]`` that the
+    kernel reads through each sequence's page-table row and does not modify.
+    The returned ``states[2:]`` are then the rows' new cache entries
+    ``[layers, batch, heads, d]`` (``heads`` >= 3, padded), which the caller
+    writes to the rows' pages at their positions.
     """
     if gate_first_kda_projection is False:
         raise ValueError("The clean decoder always uses the split KDA gate projection")
@@ -5298,6 +5394,7 @@ def decode_local(
             aux_capture=aux_capture,
             include_layer_zero=True,
             state_row=state_row,
+            page_tables=page_tables,
             kernel_options=kernel_options,
         )
     )

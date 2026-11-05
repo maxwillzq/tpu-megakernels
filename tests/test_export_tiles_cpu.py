@@ -58,6 +58,28 @@ def kernel(states, tokens, positions, sequence_rows):
     return merge(h), (merge(cs), merge(rs), k, v)
 
 
+def paged_kernel(states, tokens, positions, sequence_rows, page_tables):
+    """The kernel reading paged caches itself (``tiles.forward(paged_kernel=True)``): each
+    sequence's context through its page-table row; returns each row's new entry ``[layers, rows,
+    heads, d]`` (padded heads) instead of updated caches, which it leaves untouched."""
+    conv, rec, key_pool, value_pool = states
+    n, pages = page_tables.shape
+
+    def dense(pool):  # [pages_total, 1, 1, BS, d] -> [n, 1, 1, pages * BS, d]
+        g = pool[page_tables]  # [n, pages, 1, 1, BS, d]
+        return g.transpose(0, 2, 3, 1, 4, 5).reshape(n, 1, 1, pages * BS, pool.shape[-1])
+
+    h, (cs, rs, k, v) = kernel((conv, rec, dense(key_pool), dense(value_pool)), tokens, positions, sequence_rows)
+    rows = jnp.arange(n * sequence_rows)
+    seq = rows // sequence_rows
+
+    def entries(cache):  # [n, 1, 1, CTX, d] -> [1 layer, rows, 2 heads (padded), d]
+        e = cache[seq, :, :, positions[rows]]  # [rows, 1, 1, d]
+        return jnp.concatenate([e, jnp.full_like(e, 7.0)], axis=2).transpose(1, 0, 2, 3)
+
+    return h, (cs, rs, entries(k), entries(v))
+
+
 def zero_state():
     return (np.zeros(3, np.float32), np.zeros(2, np.float32), np.zeros((1, 1, CTX, 2), np.float32),
             np.zeros((1, 1, CTX, 1), np.float32))
@@ -170,9 +192,10 @@ def run_plan(fwd, window, plan, check_states):
             engine.finish(name)
 
 
-def make_forward(tile, sequence_rows=None):
+def make_forward(tile, sequence_rows=None, paged=False):
     return jax.jit(lambda states, controls: tiles.forward(
-        kernel, states, controls, TOKENS, H, block_size=BS, context=CTX, tile=tile, sequence_rows=sequence_rows))
+        paged_kernel if paged else kernel, states, controls, TOKENS, H, block_size=BS, context=CTX, tile=tile,
+        sequence_rows=sequence_rows, paged_kernel=paged))
 
 
 # Prefill chunks (one longer than a page and than a tile), single decodes, chunked prefill
@@ -196,18 +219,22 @@ VERIFY_PLAN = [
 ]
 
 
+# `paged`: the kernel reads and writes the pages itself (no dense copies in the graph).
+@pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("tile", [8, 2])
-def test_tiles_match_token_by_token_reference_without_checkpoints(tile):
+def test_tiles_match_token_by_token_reference_without_checkpoints(tile, paged):
     # Without checkpoints every request is a prefill chunk or a single decode.
-    run_plan(make_forward(tile), 1, PREFILL_PLAN, True)
+    run_plan(make_forward(tile, paged=paged), 1, PREFILL_PLAN, True)
 
 
+@pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("tile,sequence_rows", [(8, None), (4, None), (8, (2, 4)), (8, (4,)), (4, (2,))])
-def test_verify_windows_keep_a_checkpoint_per_token(tile, sequence_rows):
+def test_verify_windows_keep_a_checkpoint_per_token(tile, sequence_rows, paged):
     # With packed forms, the 2- and 3-token windows (and 2-token prefills) share calls.
-    run_plan(make_forward(tile, sequence_rows), W, VERIFY_PLAN, True)
+    run_plan(make_forward(tile, sequence_rows, paged), W, VERIFY_PLAN, True)
 
 
+@pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("sequence_rows", [None, (2, 4)])
-def test_prefill_steps_with_checkpoints(sequence_rows):
-    run_plan(make_forward(8, sequence_rows), W, PREFILL_PLAN, True)
+def test_prefill_steps_with_checkpoints(sequence_rows, paged):
+    run_plan(make_forward(8, sequence_rows, paged), W, PREFILL_PLAN, True)

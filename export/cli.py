@@ -42,6 +42,9 @@ def build_parser():
                    help="packed sequence-tile forms, e.g. 2,4: verify windows of up to 2 (4) tokens "
                         "share one kernel call, 4 (2) per call; each form is one more kernel call in "
                         "the forward graph")
+    p.add_argument("--no-paged-kernel", dest="paged_kernel", action="store_false",
+                   help="copy each row's MLA cache pages into a dense cache for the kernel instead of "
+                        "letting the kernel read and write the pages through page tables")
     p.add_argument("--weights", choices=["checkpoint", "none"], default="checkpoint",
                    help="convert the checkpoint into serving_checkpoint, or write subgraphs only")
     p.add_argument("--presharded", help="read the weights from kimi.load's pre-sharded TP32 layout "
@@ -70,6 +73,7 @@ def main(argv=None):
         token_buckets=args.token_buckets, req_buckets=args.req_buckets, target_tpu=args.target_tpu,
         topology=args.topology, compile_check=args.compile_check,
         max_verify_tokens=args.max_verify_tokens, sequence_rows=args.sequence_rows,
+        paged_kernel=args.paged_kernel,
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,
