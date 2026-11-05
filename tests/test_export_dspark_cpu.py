@@ -1,6 +1,6 @@
-"""``export.dspark_draft``: the DSpark drafter as rvllm's ``mtp_draft``, against the dense reference.
+"""``export.dspark_draft``: the DSpark drafter as rvllm's drafter (``draft``), against the dense reference.
 
-An engine drives the shard-local draft graph (TP4 on CPU) as rvllm drives ``mtp_draft``: every
+An engine drives the shard-local draft graph (TP4 on CPU) as rvllm drives ``draft``: every
 row of the step, its context written to pages through the block tables, ``input_ids`` shifted
 left within each request up to its last accepted row, which carries the next anchor. Rows of
 rejected drafts carry the target's hidden states for wrong tokens, so they must never be read.

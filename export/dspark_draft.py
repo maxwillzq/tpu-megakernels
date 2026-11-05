@@ -1,4 +1,4 @@
-"""The DSpark draft model (``kimi.dspark``) as rvllm's ``mtp_draft``.
+"""The DSpark draft model (``kimi.dspark``) as rvllm's drafter (``draft``, method ``dspark``).
 
 DSpark is a DFlash backbone: a small transformer whose context keys and values are projected
 from the target's hidden states at five layers (``aux_hidden_states``, which ``forward`` returns
@@ -7,8 +7,8 @@ accepted one) followed by mask tokens; slot ``j`` of the block predicts position
 1``. A low-rank Markov bias on the previous token is applied while picking the block's tokens
 left to right.
 
-rvllm runs ``mtp_draft_bucket{B}`` after every ``forward`` over the same rows (RFC 0001
-``export.mtp-draft.*``). This graph:
+rvllm runs ``draft_bucket{B}`` after every ``forward`` over the same rows (RFC 0001
+``export.draft.*``). This graph:
 
 - projects every row's ``aux_hidden_states`` to its context key and value and writes them to the
   drafter's paged KV (``draft_key``, ``draft_value``: ``[num_blocks, ranks, layers, block_size,
@@ -34,11 +34,13 @@ from .spec import Spec
 
 AUX_NAME = "aux_hidden_states"
 PREFIX = "draft."
-# ``forward``'s controls ``mtp_draft`` takes (input_ids shifted by rvllm), then its own.
+# ``forward``'s controls ``draft`` takes (input_ids shifted by rvllm), then its own.
 CONTROLS = ("input_ids", "positions", "kv_lens", "block_tables", "query_start_loc", "req_dist")
 
 
 class DSparkDrafter:
+    method = "dspark"  # speculative_config.method: vLLM's name for this drafter
+
     def __init__(self, config, cfg, tp, *, axis="model", directory=None):
         if not 1 <= cfg.max_verify_tokens:
             raise ValueError("a drafter needs --max-verify-tokens >= 1")
@@ -125,7 +127,7 @@ class DSparkDrafter:
 
 
 def draft(c, weights, controls, last, rank, aux, key_pool, value_pool, k, block_size, context):
-    """One rank's ``mtp_draft``: ``(key_pool, value_pool, draft_tokens [seqs, k])``.
+    """One rank's ``draft``: ``(key_pool, value_pool, draft_tokens [seqs, k])``.
 
     ``weights`` are this rank's ``kimi.dspark`` shards (checkpoint names); the pools are this
     rank's ``[num_blocks, 1, layers, block_size, head_dim]``.

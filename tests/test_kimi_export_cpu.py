@@ -126,10 +126,10 @@ def draft_artifact(tmp_path_factory):
     return out, meta, adapter
 
 
-def test_drafter_is_exported_as_mtp_draft(draft_artifact):
+def test_drafter_is_exported_as_draft(draft_artifact):
     out, meta, adapter = draft_artifact
     c = adapter.drafter.c
-    assert meta["serving_config"]["speculative_config"] == {"method": "mtp", "num_speculative_tokens": VERIFY}
+    assert meta["serving_config"]["speculative_config"] == {"method": "dspark", "num_speculative_tokens": VERIFY}
     # A verify step samples up to every sequence's window, capped by the largest bucket.
     assert max(int(r) for r in meta["functions"]["compute_logits"]) == min(SEQS * (VERIFY + 1), 16)
     # The drafter's weights follow the model's, so the model's checkpoint arrays keep their numbers.
@@ -145,7 +145,7 @@ def test_drafter_is_exported_as_mtp_draft(draft_artifact):
         assert aux and aux[0]["argument_type"] == "intermediate"
         assert aux[0]["shape"] == [b, len(c.aux_layers) * c.hidden]
         assert (out / fwd["file_path"]).read_text().count("stablehlo.custom_call @tpu_custom_call") == 2
-        draft = meta["functions"]["mtp_draft"][bucket]
+        draft = meta["functions"]["draft"][bucket]
         text = (out / draft["file_path"]).read_text()
         for bad in ("partition_id", "replica_id", "sdy.", "mhlo.sharding"):
             assert bad not in text, bad
