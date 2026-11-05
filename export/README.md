@@ -79,9 +79,10 @@ graph:
 - requests with one token go through decode tiles;
 - longer requests (prefill chunks, verify windows) go through sequence tiles, eight tokens at a
   time, in order;
-- each call copies its rows' state slots and pages into the kernel's dense layout, runs the
-  kernel, and writes back what changed (the KDA states, and only the cache positions the call
-  wrote);
+- each call copies its rows' KDA state slots into the kernel's row layout, runs the kernel on
+  the MLA page pools through the tile's page tables (`decode_local(page_tables=...)`), and
+  writes back what changed: the KDA states, and the rows' new cache entries, which the kernel
+  returns, into their pages;
 - a sequence starting at position 0 starts from zero KDA states, because rvllm reuses slots.
 
 **Recurrent checkpoints.** Request `r` holds slots `mamba_ckpt_indices[r]`: its state slot and
@@ -200,9 +201,11 @@ Checked against the published checkpoint's headers:
 
 ## Limitations and next steps
 
-- **Gathered caches.** Each call copies its rows' pages into a dense cache (`[rows, 24, 3, C,
-  384]` per rank), because the kernel reads caches by tile row. Next: give the kernel's cache
-  DMAs a page table, which removes the copy.
+- **Paged kernel.** The kernel reads the cache 128 positions at a time, so with 128-position
+  pages each of its cache DMAs reads one page through the page table. It leaves the pools
+  unmodified and returns the new entries: updating a donated pool in place from the Pallas
+  call makes XLA copy the whole pool around the forward's loops. `--no-paged-kernel` copies
+  each row's pages into a dense cache for the kernel instead (the previous path).
 - **Prefill.** Prefill runs eight tokens per call, as in the megakernel's own server, so long
   prompts are slow. A batched prefill kernel would be a separate subgraph.
 - **Drafter cost.** `mtp_draft` copies every request's context pages each step and attends over
