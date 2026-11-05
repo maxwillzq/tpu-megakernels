@@ -30,6 +30,9 @@ class ExportConfig:
     # to s tokens (short verify windows) share a kernel call, tile // s per call. Each form is one
     # more kernel call in the forward graph.
     sequence_rows: tuple[int, ...] = ()
+    # The kernel reads and writes the paged MLA caches through page tables itself; off, the
+    # graph copies each row's pages into a dense cache for it and writes the new positions back.
+    paged_kernel: bool = True
 
     def __post_init__(self):
         self.token_buckets = tuple(sorted(set(int(b) for b in self.token_buckets)))

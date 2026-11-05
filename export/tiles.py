@@ -53,7 +53,7 @@ TILE = 8
 
 
 def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, context, tile=TILE,
-            sequence_rows=None):
+            sequence_rows=None, paged_kernel=False):
     """``(states, hidden [num_tokens, hidden_size])`` for one rvllm step.
 
     ``sequence_rows`` (default ``(1, tile)``) are the tile forms used, each a kernel call in the
@@ -63,6 +63,13 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
     tile on dense states. ``states`` is ``(kda_conv, kda_state, mla_key, mla_value)``: the KDA
     states lead with recurrent slots, the MLA caches are pages ``[num_blocks, layers, heads,
     block_size, d]``; the kernel takes them as ``[rows, layers, heads, context, d]``.
+
+    With ``paged_kernel`` the kernel reads the pages itself:
+    ``kernel(states, tokens, positions, sequence_rows, page_tables=[sequences, context /
+    block_size])`` takes the page pools as they are and returns, in place of the caches, each
+    row's new entries ``[layers, rows, heads, d]`` (heads padded); the graph writes them to the
+    rows' pages, so it never copies a row's context into a dense cache. The kernel leaves the
+    pools unmodified: a Pallas call updating a donated pool in place makes XLA copy the pool.
     """
     sequence_rows = sorted(set(sequence_rows or ()) | {1, tile})
     if any(tile % s for s in sequence_rows):
@@ -139,6 +146,34 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
             pool, window_.astype(pool.dtype), (page, zero, zero, pos % block_size, zero)
         )
 
+    def put_entry(pool, entries, row, page_list, pos):
+        """``pool`` with row ``row``'s new entry (``entries [layers, rows, heads, d]``) at cache
+        position ``pos``."""
+        heads = pool.shape[2]
+        window_ = jax.lax.dynamic_slice_in_dim(entries, row, 1, axis=1)[:, :, :heads]  # [layers, 1, heads, d]
+        window_ = jnp.transpose(window_, (1, 0, 2, 3))[:, :, :, None, :]  # [1, layers, heads, 1, d]
+        page = page_list[jnp.clip(pos // block_size, 0, pages - 1)]
+        return jax.lax.dynamic_update_slice(
+            pool, window_.astype(pool.dtype), (page, zero, zero, pos % block_size, zero)
+        )
+
+    def call(conv_in, rec_in, key, value, page_lists, tokens, pos, s, writes):
+        """``kernel`` on one tile: ``(hidden, conv rows, rec rows, key, value)``, the page
+        pools updated at ``writes`` (``(cache row, tile row, page list, position)`` entries)."""
+        if paged_kernel:
+            h, (cs, rs, new_key, new_value) = kernel((conv_in, rec_in, key, value), tokens, pos, s,
+                                                     page_tables=jnp.stack(page_lists))
+            for _, row, page_list, position in writes:
+                key = put_entry(key, new_key, row, page_list, position)
+                value = put_entry(value, new_value, row, page_list, position)
+            return h, cs, rs, key, value
+        h, (cs, rs, k, v) = kernel(
+            (conv_in, rec_in, gather_cache(key, page_lists), gather_cache(value, page_lists)), tokens, pos, s)
+        for cache_row, _, page_list, position in writes:
+            key = put_position(key, k, cache_row, page_list, position)
+            value = put_position(value, v, cache_row, page_list, position)
+        return h, cs, rs, key, value
+
     def fresh(state, new):
         """``state`` with the rows of new sequences (position 0) zeroed: slots are reused."""
         new = jnp.reshape(new, new.shape + (1,) * (state.ndim - new.ndim))
@@ -161,17 +196,13 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
         source = jnp.stack([jnp.where(valid[i], resume_slot(request[i]), 0) for i in range(tile)])
         target = jnp.where(valid, ckpt[request, 0], 0)
         page_lists = [page_ids(request[i], valid[i]) for i in range(tile)]
-        h, (c, r, k, v) = kernel(
-            (fresh(take(conv, source), pos == 0), fresh(take(rec, source), pos == 0),
-             gather_cache(key, page_lists), gather_cache(value, page_lists)),
-            tokens, pos, 1,
+        # Each row writes one cache position.
+        h, c, r, key, value = call(
+            fresh(take(conv, source), pos == 0), fresh(take(rec, source), pos == 0), key, value, page_lists,
+            tokens, pos, 1, [(i, i, page_lists[i], pos[i]) for i in range(tile)],
         )
         conv = put(conv, target, c)
         rec = put(rec, target, r)
-        # Each row wrote one cache position.
-        for i in range(tile):
-            key = put_position(key, k, i, page_lists[i], pos[i])
-            value = put_position(value, v, i, page_lists[i], pos[i])
         hidden = hidden.at[jnp.where(valid, token_index, num_tokens)].set(h.astype(hidden.dtype), mode="drop")
         return conv, rec, key, value, hidden
 
@@ -206,9 +237,9 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
             # Each sequence's chained recurrence reads its first row's input state.
             rows_of = lambda st: jnp.repeat(fresh(take(st, source), first == 0), s, axis=0)  # noqa: E731
             page_lists = [page_ids(request[j], valid[j]) for j in range(n)]
-            h, (cs, rs, k, v) = kernel(
-                (rows_of(conv), rows_of(rec), gather_cache(key, page_lists), gather_cache(value, page_lists)),
-                tokens, pos, s,
+            h, cs, rs, key, value = call(
+                rows_of(conv), rows_of(rec), key, value, page_lists, tokens, pos, s,
+                [(j, j * s + i, page_lists[j], first[j] + i) for j in range(n) for i in range(s)],
             )
             own = ckpt[row_request]  # [tile, window]
             verify = row_request < num_decode
@@ -217,10 +248,6 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
             target = jnp.where(keep, jnp.take_along_axis(own, pick[:, None], axis=1)[:, 0], 0)
             conv = put(conv, target, cs)
             rec = put(rec, target, rs)
-            for j in range(n):
-                for i in range(s):
-                    key = put_position(key, k, j, page_lists[j], first[j] + i)
-                    value = put_position(value, v, j, page_lists[j], first[j] + i)
             hidden = hidden.at[jnp.where(live, token_index, num_tokens)].set(h.astype(hidden.dtype), mode="drop")
             return conv, rec, key, value, hidden
 
@@ -252,9 +279,10 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
         # The chained recurrence reads row 0's input state.
         rows_of = lambda s: jnp.broadcast_to(fresh(one(s), first == 0), (tile, *s.shape[1:]))  # noqa: E731
         page_list = page_ids(request)
-        h, (cs, rs, k, v) = kernel(
-            (rows_of(conv), rows_of(rec), gather_cache(key, [page_list]), gather_cache(value, [page_list])),
-            tokens, first + rows, tile,
+        # The tile writes cache positions first .. first + tile - 1.
+        h, cs, rs, key, value = call(
+            rows_of(conv), rows_of(rec), key, value, [page_list], tokens, first + rows, tile,
+            [(0, j, page_list, first + j) for j in range(tile)],
         )
         # A verify window keeps the state after each of its tokens; any other request keeps
         # only its final one. Rows that keep nothing write the null slot.
@@ -263,10 +291,6 @@ def forward(kernel, states, controls, num_tokens, hidden_size, *, block_size, co
         target = jnp.where(keep, jnp.where(verify, own[jnp.minimum(rows, window - 1)], own[0]), 0)
         conv = put(conv, target, cs)
         rec = put(rec, target, rs)
-        # The tile wrote cache positions first .. first + tile - 1.
-        for j in range(tile):
-            key = put_position(key, k, 0, page_list, first + j)
-            value = put_position(value, v, 0, page_list, first + j)
         hidden = hidden.at[jnp.where(valid, token_index, num_tokens)].set(h.astype(hidden.dtype), mode="drop")
         return conv, rec, key, value, hidden
 
