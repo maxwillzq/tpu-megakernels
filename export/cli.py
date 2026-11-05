@@ -56,7 +56,7 @@ def build_parser():
                         "an artifact whose subgraphs were exported with --weights none")
     p.add_argument("--workers", type=int, default=2, help="ranks converted in parallel")
     p.add_argument("--draft", help="DSpark speculator checkpoint directory (RedHatAI/Kimi-K3-speculator.dspark): "
-                   "also export it as rvllm's mtp_draft, drafting --max-verify-tokens tokens per step")
+                   "also export it as rvllm's drafter (draft, method dspark), drafting --max-verify-tokens tokens per step")
     p.add_argument("--draft-weights-only", action="store_true",
                    help="with --checkpoint-only: add only the drafter's arrays to an existing serving_checkpoint")
     return p

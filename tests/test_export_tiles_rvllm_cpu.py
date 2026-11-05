@@ -8,7 +8,7 @@ a stand-in kernel and a one-character-per-token tokenizer. Checks:
 - structured outputs (JSON schemas) give valid JSON, and the same text with jump-forward decoding
   (grammar-forced tokens verified as drafts, which needs the recurrent checkpoints) as without
   it, in fewer engine steps;
-- with a drafter (rvllm's ``mtp_draft``, whose drafts are the target's greedy tokens), free-form
+- with a drafter (rvllm's drafter (``draft``), whose drafts are the target's greedy tokens), free-form
   and structured requests give the same text in fewer steps still.
 
 Needs ``RVLLM_BIN`` and ``PJRT_CPU_LIB_PATH`` (the rvllm-dev image has both the binary's

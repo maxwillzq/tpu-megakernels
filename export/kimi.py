@@ -138,7 +138,7 @@ class KimiAdapter:
         self.gate_up = gate_up
         self.weights = weight_layout(checkpoint, layers, gate_up)
         self.context = cache_length(cfg.max_model_len, cfg.block_size)
-        # The DSpark drafter (``export.dspark_draft``), exported as rvllm's ``mtp_draft``.
+        # The DSpark drafter (``export.dspark_draft``), exported as rvllm's drafter (``draft``).
         self.drafter = None
         if draft is not None:
             from .dspark_draft import DSparkDrafter

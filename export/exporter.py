@@ -8,7 +8,7 @@ shard-local bodies. The artifact holds (RFC 0001):
   -> updated states and ``hidden_states [B, H]``;
 - ``compute_logits_req{R}``: ``hidden_states [R, H]`` and the LM head -> ``logits [R, V]``;
 - the four sampler families per R (``export.sampling``);
-- with a drafter (``adapter.drafter``), ``mtp_draft_bucket{B}``: ``forward``'s controls with
+- with a drafter (``adapter.drafter``), ``draft_bucket{B}``: ``forward``'s controls with
   rvllm's shifted ``input_ids``, ``last_token_indices``, the drafter's weights, the
   intermediate ``forward`` returns for it and its donated paged KV -> that KV and
   ``draft_tokens [max_num_seqs, k]``; ``serving_config.speculative_config`` declares it.
@@ -235,7 +235,7 @@ class Exporter:
             "outputs": outputs,
         }
 
-    def mtp_draft(self, bucket):
+    def draft(self, bucket):
         a, cfg = self.adapter, self.cfg
         d = a.drafter
         from .dspark_draft import CONTROLS
@@ -250,7 +250,7 @@ class Exporter:
         in_specs = controls + constants + weights + [aux] + states
         first_state = len(in_specs) - len(states)
         tokens = d.tokens_spec()
-        name = f"mtp_draft_bucket{bucket}"
+        name = f"draft_bucket{bucket}"
         text = self._lower(
             d.body(len(CONTROLS), len(constants), len(weights)), in_specs, states + [tokens], name,
             {first_state + i: i for i in range(len(states))}, compile_check=cfg.compile_check,
@@ -333,10 +333,10 @@ class Exporter:
             functions["forward"][str(b)] = self.forward(b)
         drafter = getattr(a, "drafter", None)
         if drafter:
-            functions["mtp_draft"] = {}
+            functions["draft"] = {}
             for b in cfg.token_buckets:
-                log(f"lowering mtp_draft_bucket{b}")
-                functions["mtp_draft"][str(b)] = self.mtp_draft(b)
+                log(f"lowering draft_bucket{b}")
+                functions["draft"][str(b)] = self.draft(b)
         functions["compute_logits"] = {}
         for r in cfg.req_buckets:
             log(f"lowering compute_logits_req{r} and samplers")
@@ -358,7 +358,7 @@ class Exporter:
             "data_parallel_size": 1,
         }
         if drafter:
-            serving["speculative_config"] = {"method": "mtp", "num_speculative_tokens": drafter.k}
+            serving["speculative_config"] = {"method": drafter.method, "num_speculative_tokens": drafter.k}
         serving.update(a.write_companion_files(self.out))
         metadata = {
             "format_version": 2,

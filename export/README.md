@@ -45,7 +45,7 @@ python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k
   drafts. `0` exports a forward without checkpoints, where rvllm decodes structured outputs one
   token per step.
 - **Speculative decoding.** `--draft DIR` (the `RedHatAI/Kimi-K3-speculator.dspark` checkpoint)
-  also exports the DSpark draft model as rvllm's `mtp_draft`, drafting `--max-verify-tokens`
+  also exports the DSpark draft model as rvllm's drafter (`draft`, method `dspark`), drafting `--max-verify-tokens`
   tokens per step (see [Drafting](#drafting)). Its weights follow the model's in
   `serving_checkpoint`, so `--checkpoint-only --draft-weights-only --draft DIR --checkpoint-dir
   ART` adds them to an existing artifact without rewriting the model's arrays.
@@ -120,12 +120,13 @@ block scales), stored as `[32, *local]` arrays split over ranks. Rank `r`'s slab
 ## Drafting
 
 DSpark is a separate draft model (a 5-layer DFlash backbone with a Markov head), not a
-multi-token-prediction layer of K3; rvllm's drafter contract is named after MTP but fits any
-drafter with its own paged KV (rvllm issue 280 tracks a general name). With `--draft`:
+multi-token-prediction layer of K3. rvllm's drafter contract (`draft` / `draft_bucket{B}`) fits
+any drafter with its own paged KV; the artifact declares `speculative_config.method` `"dspark"`,
+vLLM's name for it. With `--draft`:
 
 - `forward` also returns `aux_hidden_states [B, 5 * 7168]`, the residual stream entering layers
   24, 48, 72, 88 and 92 of every row (the megakernel's `aux_hidden_layers`);
-- `mtp_draft_bucket{B}` (`export/dspark_draft.py`) projects every row of the step to its
+- `draft_bucket{B}` (`export/dspark_draft.py`) projects every row of the step to its
   context key and value and writes them to the drafter's paged KV (`draft_key`, `draft_value`,
   `[num_blocks, 32, 5, block_size, 64]`, through the model's block tables). Then, for every
   request, it runs the block of the anchor (the token sampled after its last accepted one, at
@@ -157,7 +158,7 @@ The megakernel moves data between devices with remote DMAs addressed by mesh pos
 | `lowering.py` | lowers `jit(shard_map(body))` under the GSPMD partitioner and keeps its per-device `@shmap_body` as `@main` |
 | `exporter.py` | assembles the subgraphs and `metadata.json`, and checks each `@main` against the declared shard-local shapes |
 | `tiles.py` | ragged batch with state slots, checkpoints and pages -> megakernel tiles |
-| `dspark_draft.py` | the DSpark drafter as rvllm's `mtp_draft` |
+| `dspark_draft.py` | the DSpark drafter as rvllm's drafter (`draft`, method `dspark`) |
 | `kimi.py` | Kimi adapter: weight and state specs, the forward and logits bodies, companion files |
 | `kimi_checkpoint.py` | Hugging Face checkpoint -> the megakernel's per-rank weights |
 | `sampling.py` | JAX ports of vllm-torchtpu's samplers |
@@ -178,7 +179,7 @@ XLA_FLAGS=--xla_force_host_platform_device_count=4 JAX_PLATFORMS=cpu pytest \
   decode and prefill steps, chunks that do not fill a tile, verify windows with all, none or some
   drafts accepted, preempted sequences prefilling again, and slot and page reuse.
 - `test_export_dspark_cpu.py`: the drafter graph (TP4) against `kimi.dspark`'s dense reference,
-  driven as rvllm drives `mtp_draft`: paged context, verify windows with rejected rows,
+  driven as rvllm drives `draft`: paged context, verify windows with rejected rows,
   chunked prefill, the sliding window and page reuse.
 - `test_export_tiles_rvllm_cpu.py`: rvllm serves a toy artifact with the same structure on CPU.
   Concurrent greedy requests must give the reference's tokens; JSON-schema outputs must be valid
@@ -189,7 +190,7 @@ XLA_FLAGS=--xla_force_host_platform_device_count=4 JAX_PLATFORMS=cpu pytest \
 - `test_kimi_export_cpu.py`: exports a 4-layer megakernel prefix for `tpu7x:2x2x4`. It checks the
   weight layout, the two kernel calls per forward, donation, shard-local types, the device
   assignment, that the compiled forward keeps the page pools in the kernel's layout (no
-  copies), and the `mtp_draft` contract with a drafter.
+  copies), and the `draft` contract with a drafter.
 - `test_kimi_checkpoint_cpu.py`: rank slabs of the converted checkpoint, conversion of a
   pre-sharded layer prefix, and the lossless FP8 reblock.
 - `test_kimi_tokenizer_cpu.py`: the converted tokenizer and the chat template.
@@ -208,7 +209,7 @@ Checked against the published checkpoint's headers:
   each row's pages into a dense cache for the kernel instead (the previous path).
 - **Prefill.** Prefill runs eight tokens per call, as in the megakernel's own server, so long
   prompts are slow. A batched prefill kernel would be a separate subgraph.
-- **Drafter cost.** `mtp_draft` copies every request's context pages each step and attends over
+- **Drafter cost.** `draft` copies every request's context pages each step and attends over
   the whole context (masked to the window). The megakernel repo's fused Pallas draft kernel is
   single-sequence; a batched one would replace this.
 - **Not exported:** the `tuned` recipe's sequence-parallel epilogue.

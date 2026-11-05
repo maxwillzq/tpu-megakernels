@@ -6,7 +6,7 @@ expressions) compile and grammar-forced tokens become jump-forward drafts.
 The kernel is a toy recurrence over embedded tokens; the LM head maps its hidden state to logits.
 ``reference_greedy`` generates the same tokens token by token.
 
-With ``draft=True`` the artifact also drafts with rvllm's ``mtp_draft`` (``ToyDrafter``): forward
+With ``draft=True`` the artifact also drafts with rvllm's drafter, ``draft`` (``ToyDrafter``): forward
 returns each row's input token as ``aux_hidden_states``, the drafter keeps them in a paged pool of
 its own and drafts by rerunning the toy model over the context, so its drafts are the target's
 greedy tokens (they all verify, unless bf16 rounding differs).
@@ -45,7 +45,9 @@ def step(conv, rec, key, value, embedded, pos):
 
 
 class ToyDrafter:
-    """rvllm's ``mtp_draft`` for the toy model (the interface of ``export.dspark_draft``)."""
+    """rvllm's drafter (``draft``) for the toy model (the interface of ``export.dspark_draft``)."""
+
+    method = "mtp"
 
     def __init__(self, cfg, context):
         self.cfg, self.context, self.k = cfg, context, cfg.max_verify_tokens
