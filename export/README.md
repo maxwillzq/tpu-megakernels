@@ -11,10 +11,15 @@ every forward step runs the megakernel. The layout follows vllm-torchtpu's
 ```bash
 pip install "jax[tpu]"   # libtpu: lowers for a TPU topology on any host, no TPU needed
 
-python -m export kimi --checkpoint /path/to/Kimi-K3 --output-dir /path/to/kimi-k3-megakernel \
-  --max-num-seqs 32 --max-model-len 4096 --num-blocks 1056 --token-buckets 8,16,32,64,128
+python -m export kimi --checkpoint /path/to/Kimi-K3 --model-name moonshotai/Kimi-K3 \
+  --output-dir /path/to/kimi-k3-megakernel --max-num-seqs 32 --max-model-len 4096 --num-blocks 1056 --token-buckets 8,16,32,64,128
 ```
 
+- **Model name.** `--model-name` is recorded as `model_name` in `metadata.json` and feeds the
+  serving runtime's KV transfer fingerprint, so exports of one model must agree on it. Without
+  it the name comes from `--checkpoint`: a hub id is kept, a hub cache path
+  (`.../models--org--name/snapshots/...`) gives `org/name`, any other path its last component
+  (with a warning).
 - **Topology.** Lowering targets `--topology tpu7x:2x2x4` (16 chips, 32 TensorCores, 4 hosts),
   the megakernel's TP32 slice.
 - **Weights.** `--weights none` writes the subgraphs and metadata only (about 30 s for the full
