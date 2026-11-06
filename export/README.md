@@ -6,6 +6,9 @@ and the tokenizer files. rvllm then serves it with continuous batching and its O
 every forward step runs the megakernel. The layout follows vllm-torchtpu's
 `experimental/export`.
 
+Measured correctness and throughput on a v7x `2x2x4` slice (98 / 687 tok/s at 1 / 8 concurrent
+requests) are in [PERF_KIMI_K3.md](PERF_KIMI_K3.md).
+
 ## Usage
 
 ```bash
