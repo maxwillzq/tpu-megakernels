@@ -5,10 +5,33 @@ target TPU topology (needs libtpu, not a TPU).
 """
 
 import argparse
+import os
+import re
+import sys
+
+# A Hugging Face hub cache snapshot: .../models--{org}--{name}/snapshots/{revision}.
+_HF_CACHE_REPO = re.compile(r"(?:^|/)models--([^/]+?)--([^/]+)(?:/|$)")
 
 
 def _ints(text):
     return tuple(int(x) for x in text.split(",") if x)
+
+
+def artifact_model_name(checkpoint, model_name=None):
+    """The model's name for the artifact's metadata (e.g. ``moonshotai/Kimi-K3``), not the path
+    the checkpoint was read from: it feeds the serving runtime's KV transfer fingerprint, so two
+    exports of one model from different paths must record the same name."""
+    if model_name:
+        return model_name
+    if "://" not in checkpoint and not os.path.exists(checkpoint):
+        return checkpoint  # a hub id
+    m = _HF_CACHE_REPO.search(checkpoint)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    name = os.path.basename(checkpoint.rstrip("/")) or checkpoint
+    print(f"model_name: recording {name!r} from the checkpoint location {checkpoint!r}; pass "
+          "--model-name (e.g. moonshotai/Kimi-K3) to record the model's hub id", file=sys.stderr)
+    return name
 
 
 def build_parser():
@@ -18,6 +41,10 @@ def build_parser():
     p.add_argument("--checkpoint", required=True,
                    help="Hugging Face K3 checkpoint directory (or its config, index, tokenizer and "
                         "headers.json, with --weights none)")
+    p.add_argument("--model-name",
+                   help="the model's name in the artifact's metadata, e.g. moonshotai/Kimi-K3 "
+                        "(default: derived from --checkpoint: a hub id or hub cache path gives "
+                        "org/name, else the directory's name)")
     p.add_argument("--layers", type=int, default=93, help="keep only the first N layers (bring-up)")
     p.add_argument("--max-num-seqs", type=int, default=32)
     p.add_argument("--max-model-len", type=int, default=4096)
@@ -77,7 +104,8 @@ def main(argv=None):
     )
     source = HeaderCheckpoint(args.checkpoint, args.layers)
     adapter = KimiAdapter(source, cfg, layers=args.layers, gate_up=args.gate_up,
-                          model_name=args.checkpoint, draft=args.draft)
+                          model_name=artifact_model_name(args.checkpoint, args.model_name),
+                          draft=args.draft)
     if args.checkpoint_only:
         # abstract_params order: constants, then weights (export.exporter.Exporter.slots).
         specs, axis_sizes = adapter.constant_specs() + adapter.param_specs(), {adapter.axis: TP, "data": 1}
